@@ -865,7 +865,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             wav = block(wav)
         return wav.clamp(min=-1, max=1)
 
-    def chunked_decode(self, codes, chunk_size=300, left_context_size=25):
+    def chunked_decode(self, codes: torch.Tensor, chunk_size: int = 300, left_context_size: int = 25) -> torch.Tensor:
         """
         Decode codec tokens to audio waveform in chunks.
 
@@ -873,6 +873,9 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             codes: Codec tokens, shape [B, num_quantizers, T]
             chunk_size: Number of frames per chunk
             left_context_size: Context frames from previous chunk
+
+        Returns:
+            torch.Tensor: Decoded audio waveform
         """
         # Filter out invalid frames: decoder codebook only has `codebook_size` entries
         # Any token >= codebook_size (including EOS tokens) should be truncated

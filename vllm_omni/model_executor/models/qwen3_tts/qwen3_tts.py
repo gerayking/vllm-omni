@@ -15,7 +15,7 @@
 import base64
 import io
 import urllib.request
-from collections.abc import Iterable
+from collections.abc import Generator, Iterable
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -1280,7 +1280,7 @@ class Qwen3TTSModel:
         chunk_size: int = 25,
         left_context_size: int = 25,
         **kwargs: Any,
-    ):
+    ) -> Generator[tuple[np.ndarray, bool, int], None, None]:
         """
         Streaming version of generate_custom_voice. Yields audio chunks as they are generated.
 
@@ -1371,7 +1371,7 @@ class Qwen3TTSModel:
         chunk_size: int = 25,
         left_context_size: int = 25,
         **kwargs: Any,
-    ):
+    ) -> Generator[tuple[np.ndarray, bool, int], None, None]:
         """
         Streaming version of generate_voice_design. Yields audio chunks as they are generated.
 
@@ -1450,7 +1450,7 @@ class Qwen3TTSModel:
         chunk_size: int = 25,
         left_context_size: int = 25,
         **kwargs: Any,
-    ):
+    ) -> Generator[tuple[np.ndarray, bool, int], None, None]:
         """
         Streaming version of generate_voice_clone. Yields audio chunks as they are generated.
 

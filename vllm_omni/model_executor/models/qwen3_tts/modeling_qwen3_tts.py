@@ -21,6 +21,7 @@ from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 from librosa.filters import mel as librosa_mel_fn
 from torch import nn
@@ -2182,7 +2183,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
                     accumulated_hidden = []
                     chunk_idx += 1
 
-            if is_eos:
+            if is_eos or max_new_tokens is not None and total_generated >= max_new_tokens:
                 break
 
         # Yield any remaining tokens
@@ -2436,7 +2437,6 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
     ):
         talker_kwargs = {
             "max_new_tokens": max_new_tokens,
-            "min_new_tokens": 2,
             "do_sample": do_sample,
             "top_k": top_k,
             "top_p": top_p,
@@ -2732,7 +2732,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         voice_clone_prompt: list[dict] = None,
         languages: list[str] = None,
         speakers: list[str] = None,
-        non_streaming_mode=False,
+        non_streaming_mode: bool = False,
         max_new_tokens: int = 4096,
         do_sample: bool = True,
         top_k: int = 50,
@@ -2746,8 +2746,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         repetition_penalty: float = 1.05,
         chunk_size: int = 25,
         left_context_size: int = 25,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> Generator[tuple[np.ndarray, bool, int], None, None]:
         """
         True streaming generation method that yields audio chunks as tokens are generated.
 
@@ -2777,7 +2777,6 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             repetition_penalty: Repetition penalty for generation
             chunk_size: Number of codec frames per audio chunk (default 25)
             left_context_size: Context frames for smooth chunk boundaries (default 25)
-            **kwargs: Additional generation arguments
 
         Yields:
             tuple[np.ndarray, bool, int]: (audio_chunk, is_finished, sample_rate)
@@ -2823,7 +2822,6 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 tts_pad_embed=tts_pad_embed,
                 chunk_size=chunk_size,
                 max_new_tokens=max_new_tokens,
-                min_new_tokens=2,
                 do_sample=do_sample,
                 top_k=top_k,
                 top_p=top_p,
@@ -3071,177 +3069,6 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             talker_input_embed = torch.cat(talker_input_embed_parts + [talker_input_embed], dim=1)
 
         return talker_input_embed, trailing_text_hidden, tts_pad_embed
-
-    @torch.no_grad()
-    def generate_streaming_legacy(
-        self,
-        input_ids: list[torch.Tensor] | None = None,
-        instruct_ids: list[torch.Tensor] | None = None,
-        ref_ids: list[torch.Tensor] | None = None,
-        voice_clone_prompt: list[dict] = None,
-        languages: list[str] = None,
-        speakers: list[str] = None,
-        non_streaming_mode=False,
-        max_new_tokens: int = 4096,
-        do_sample: bool = True,
-        top_k: int = 50,
-        top_p: float = 1.0,
-        temperature: float = 0.9,
-        subtalker_dosample: bool = True,
-        subtalker_top_k: int = 50,
-        subtalker_top_p: float = 1.0,
-        subtalker_temperature: float = 0.9,
-        eos_token_id: int | None = None,
-        repetition_penalty: float = 1.05,
-        chunk_size: int = 25,
-        left_context_size: int = 25,
-        **kwargs,
-    ):
-        """
-        Legacy streaming generation method (generates all tokens first, then streams audio).
-
-        Kept for backward compatibility. For true streaming, use generate_streaming().
-        """
-        # First, generate all talker codes (this is the same as regular generate)
-        talker_codes_list, _ = self.generate(
-            input_ids=input_ids,
-            instruct_ids=instruct_ids,
-            ref_ids=ref_ids,
-            voice_clone_prompt=voice_clone_prompt,
-            languages=languages,
-            speakers=speakers,
-            non_streaming_mode=non_streaming_mode,
-            max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            top_k=top_k,
-            top_p=top_p,
-            temperature=temperature,
-            subtalker_dosample=subtalker_dosample,
-            subtalker_top_k=subtalker_top_k,
-            subtalker_top_p=subtalker_top_p,
-            subtalker_temperature=subtalker_temperature,
-            eos_token_id=eos_token_id,
-            repetition_penalty=repetition_penalty,
-            **kwargs,
-        )
-
-        # For each sample in the batch, decode and yield audio chunks
-        for sample_idx, talker_codes in enumerate(talker_codes_list):
-            # Get reference codes for voice cloning if applicable
-            ref_code = None
-            if voice_clone_prompt is not None:
-                ref_code_list = voice_clone_prompt.get("ref_code", None)
-                if ref_code_list is not None and ref_code_list[sample_idx] is not None:
-                    ref_code = ref_code_list[sample_idx].to(talker_codes.device)
-
-            # Prepend reference codes if available
-            if ref_code is not None:
-                full_codes = torch.cat([ref_code, talker_codes], dim=0)
-            else:
-                full_codes = talker_codes
-
-            # Decode in chunks
-            total_frames = full_codes.shape[0]
-            start_index = 0
-            chunk_idx = 0
-
-            while start_index < total_frames:
-                end_index = min(start_index + chunk_size, total_frames)
-
-                # Calculate context for smooth boundaries
-                if start_index == 0:
-                    context_size = 0
-                else:
-                    context_size = min(left_context_size, start_index)
-
-                # Extract chunk with context
-                codes_chunk = full_codes[start_index - context_size : end_index]
-
-                # Decode the chunk
-                # codes_chunk shape: [T, Q] -> [1, T, Q]
-                # model.decode expects [B, T, K] and internally transposes to [B, K, T]
-                codes_for_decode = codes_chunk.unsqueeze(0)
-
-                # Decode using speech tokenizer
-                wavs, sr = self.speech_tokenizer.decode({"audio_codes": codes_for_decode})
-                audio_chunk = wavs[0]
-
-                # Remove context portion from the output
-                if context_size > 0:
-                    upsample_rate = getattr(self.speech_tokenizer.model, "decode_upsample_rate", 2000)
-                    context_samples = context_size * upsample_rate
-                    if context_samples < len(audio_chunk):
-                        audio_chunk = audio_chunk[context_samples:]
-
-                is_finished = end_index >= total_frames
-
-                yield audio_chunk, is_finished, sr
-
-                start_index = end_index
-                chunk_idx += 1
-
-    def generate_streaming_to_list(
-        self,
-        input_ids: list[torch.Tensor] | None = None,
-        instruct_ids: list[torch.Tensor] | None = None,
-        ref_ids: list[torch.Tensor] | None = None,
-        voice_clone_prompt: list[dict] = None,
-        languages: list[str] = None,
-        speakers: list[str] = None,
-        non_streaming_mode=False,
-        max_new_tokens: int = 4096,
-        do_sample: bool = True,
-        top_k: int = 50,
-        top_p: float = 1.0,
-        temperature: float = 0.9,
-        subtalker_dosample: bool = True,
-        subtalker_top_k: int = 50,
-        subtalker_top_p: float = 1.0,
-        subtalker_temperature: float = 0.9,
-        eos_token_id: int | None = None,
-        repetition_penalty: float = 1.05,
-        chunk_size: int = 25,
-        left_context_size: int = 25,
-        **kwargs,
-    ) -> tuple[list, int]:
-        """
-        Convenience method that collects all streaming chunks into a list.
-
-        Useful for testing or when you want to process all chunks after generation.
-
-        Returns:
-            tuple: (list of audio chunks, sample_rate)
-        """
-        chunks = []
-        sample_rate = None
-
-        for audio_chunk, is_finished, sr in self.generate_streaming(
-            input_ids=input_ids,
-            instruct_ids=instruct_ids,
-            ref_ids=ref_ids,
-            voice_clone_prompt=voice_clone_prompt,
-            languages=languages,
-            speakers=speakers,
-            non_streaming_mode=non_streaming_mode,
-            max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            top_k=top_k,
-            top_p=top_p,
-            temperature=temperature,
-            subtalker_dosample=subtalker_dosample,
-            subtalker_top_k=subtalker_top_k,
-            subtalker_top_p=subtalker_top_p,
-            subtalker_temperature=subtalker_temperature,
-            eos_token_id=eos_token_id,
-            repetition_penalty=repetition_penalty,
-            chunk_size=chunk_size,
-            left_context_size=left_context_size,
-            **kwargs,
-        ):
-            chunks.append(audio_chunk)
-            sample_rate = sr
-
-        return chunks, sample_rate
 
 
 __all__ = [
