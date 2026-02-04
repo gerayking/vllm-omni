@@ -87,6 +87,8 @@ class Qwen3TTSModelForGeneration(nn.Module):
 
         # Store vllm_config for potential future use
         self.vllm_config = vllm_config
+        # Track streaming state for accumulating audio chunks
+        self._streaming_state = {}
 
     def forward(
         self,
@@ -104,7 +106,7 @@ class Qwen3TTSModelForGeneration(nn.Module):
             positions: Position IDs (not used for TTS, but required by runner)
             intermediate_tensors: Intermediate tensors for pipeline parallelism (not used)
             inputs_embeds: Input embeddings (not used for TTS, but required by runner)
-            **kwargs: Additional arguments including task_type, sampling_metadata, etc.
+            **kwargs: Additional arguments including task_type, sampling_metadata, stream, etc.
 
         Returns:
             OmniOutput: Contains multimodal outputs with audio tensors
@@ -121,6 +123,23 @@ class Qwen3TTSModelForGeneration(nn.Module):
         speaker = runtime_additional_information.pop("speaker", ["uncle_fu"])[0]
         language = runtime_additional_information.pop("language", ["Auto"])[0]
         instruct = runtime_additional_information.pop("instruct", [""])[0]
+        # Check if streaming mode is requested
+        stream = (
+            runtime_additional_information.pop("stream", [False])[0]
+            if "stream" in runtime_additional_information
+            else False
+        )
+        chunk_size = (
+            runtime_additional_information.pop("chunk_size", [25])[0]
+            if "chunk_size" in runtime_additional_information
+            else 25
+        )
+        left_context_size = (
+            runtime_additional_information.pop("left_context_size", [25])[0]
+            if "left_context_size" in runtime_additional_information
+            else 25
+        )
+        print(f"chunk_size : {chunk_size}, {runtime_additional_information}")
         for key, value in runtime_additional_information.items():
             if isinstance(value, list) and len(value) > 0:
                 runtime_additional_information[key] = value[0]
@@ -132,6 +151,19 @@ class Qwen3TTSModelForGeneration(nn.Module):
         if not text:
             logger.info("Profile run detected (empty text). Capping max_new_tokens to 2.")
             runtime_additional_information["max_new_tokens"] = 2
+        # Check if this is a streaming request
+        if stream:
+            return self.forward_streaming(
+                text=text,
+                task_type=task_type,
+                speaker=speaker,
+                language=language,
+                instruct=instruct,
+                chunk_size=chunk_size,
+                left_context_size=left_context_size,
+                **runtime_additional_information,
+                **kwargs,
+            )
 
         # Call the appropriate generation method based on task_type
         if task_type == "CustomVoice":
@@ -149,6 +181,155 @@ class Qwen3TTSModelForGeneration(nn.Module):
 
         # Convert result to OmniOutput format
         return self.make_omni_output(result, **kwargs)
+
+    def forward_streaming(
+        self,
+        text: str,
+        task_type: str,
+        speaker: str = "uncle_fu",
+        language: str = "Auto",
+        instruct: str = "",
+        chunk_size: int = 25,
+        left_context_size: int = 25,
+        **kwargs: Any,
+    ) -> OmniOutput:
+        """
+        Forward pass for streaming TTS generation.
+
+        This method handles streaming by maintaining state and returning one audio chunk at a time.
+        The caller should call this repeatedly until is_finished is True.
+
+        Args:
+            text: Text to synthesize
+            task_type: Type of TTS task (CustomVoice, VoiceDesign, Base)
+            speaker: Speaker name for CustomVoice
+            language: Language code
+            instruct: Instruction text
+            chunk_size: Number of codec frames per chunk
+            left_context_size: Context frames for smooth boundaries
+            **kwargs: Additional generation options
+
+        Returns:
+            OmniOutput: Contains audio chunk and streaming status
+        """
+        request_id = kwargs.get("request_id", "default")
+
+        # Initialize streaming state if not exists
+        if request_id not in self._streaming_state:
+            # Start streaming generation
+            if task_type == "CustomVoice":
+                generator = self.model.generate_custom_voice_streaming(
+                    text,
+                    speaker=speaker,
+                    language=language,
+                    instruct=instruct,
+                    chunk_size=chunk_size,
+                    left_context_size=left_context_size,
+                    **{
+                        k: v
+                        for k, v in kwargs.items()
+                        if k not in ["request_id", "sampling_metadata", "logits_index", "sampler"]
+                    },
+                )
+            elif task_type == "VoiceDesign":
+                generator = self.model.generate_voice_design_streaming(
+                    text,
+                    instruct=instruct,
+                    language=language,
+                    chunk_size=chunk_size,
+                    left_context_size=left_context_size,
+                    **{
+                        k: v
+                        for k, v in kwargs.items()
+                        if k not in ["request_id", "sampling_metadata", "logits_index", "sampler"]
+                    },
+                )
+            elif task_type == "Base":
+                generator = self.model.generate_voice_clone_streaming(
+                    text,
+                    language=language,
+                    chunk_size=chunk_size,
+                    left_context_size=left_context_size,
+                    **{
+                        k: v
+                        for k, v in kwargs.items()
+                        if k not in ["request_id", "sampling_metadata", "logits_index", "sampler"]
+                    },
+                )
+            else:
+                raise ValueError(f"Invalid task type: {task_type}")
+
+            self._streaming_state[request_id] = {
+                "generator": generator,
+                "audio_chunks": [],
+                "is_finished": False,
+                "sample_rate": None,
+            }
+
+        state = self._streaming_state[request_id]
+
+        # If already finished, return final output
+        if state["is_finished"]:
+            # Clean up state and return accumulated audio
+            audio_chunks = state["audio_chunks"]
+            sr = state["sample_rate"]
+            del self._streaming_state[request_id]
+
+            if audio_chunks:
+                full_audio = np.concatenate(audio_chunks)
+                audio_tensor = torch.from_numpy(full_audio).float()
+                return OmniOutput(
+                    text_hidden_states=None,
+                    multimodal_outputs={
+                        "model_outputs": audio_tensor,
+                        "sr": torch.tensor(sr, dtype=torch.int),
+                        "finished": torch.tensor(True),
+                    },
+                )
+            return OmniOutput(text_hidden_states=None, multimodal_outputs={"finished": torch.tensor(True)})
+
+        # Get next chunk from generator
+        try:
+            audio_chunk, is_finished, sr = next(state["generator"])
+            state["audio_chunks"].append(
+                audio_chunk if isinstance(audio_chunk, np.ndarray) else audio_chunk.cpu().numpy()
+            )
+            state["sample_rate"] = sr
+            state["is_finished"] = is_finished
+
+            # Convert chunk to tensor
+            if isinstance(audio_chunk, np.ndarray):
+                audio_tensor = torch.from_numpy(audio_chunk).float()
+            else:
+                audio_tensor = audio_chunk.float()
+
+            return OmniOutput(
+                text_hidden_states=None,
+                multimodal_outputs={
+                    "model_outputs": audio_tensor,
+                    "sr": torch.tensor(sr, dtype=torch.int),
+                    "finished": torch.tensor(is_finished),
+                },
+            )
+        except StopIteration:
+            # Generator exhausted
+            state["is_finished"] = True
+            audio_chunks = state["audio_chunks"]
+            sr = state["sample_rate"]
+            del self._streaming_state[request_id]
+
+            if audio_chunks:
+                full_audio = np.concatenate(audio_chunks)
+                audio_tensor = torch.from_numpy(full_audio).float()
+                return OmniOutput(
+                    text_hidden_states=None,
+                    multimodal_outputs={
+                        "model_outputs": audio_tensor,
+                        "sr": torch.tensor(sr, dtype=torch.int),
+                        "finished": torch.tensor(True),
+                    },
+                )
+            return OmniOutput(text_hidden_states=None, multimodal_outputs={"finished": torch.tensor(True)})
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput | tuple, **kwargs: Any) -> OmniOutput:
         """
@@ -1086,3 +1267,279 @@ class Qwen3TTSModel:
         if supported is None:
             return None
         return sorted(supported)
+
+    # ==================== Streaming Generation Methods ====================
+
+    @torch.inference_mode()
+    def generate_custom_voice_streaming(
+        self,
+        text: str | list[str],
+        speaker: str | list[str],
+        language: str | list[str] = None,
+        instruct: str | list[str] | None = None,
+        chunk_size: int = 25,
+        left_context_size: int = 25,
+        **kwargs: Any,
+    ):
+        """
+        Streaming version of generate_custom_voice. Yields audio chunks as they are generated.
+
+        Args:
+            text: Text(s) to synthesize.
+            speaker: Speaker name(s).
+            language: Language(s) for each sample.
+            instruct: Optional instruction(s).
+            chunk_size: Number of codec frames per audio chunk (default 25).
+            left_context_size: Context frames for smooth chunk boundaries (default 25).
+            **kwargs: Additional generation options.
+
+        Yields:
+            tuple[np.ndarray, bool, int]: (audio_chunk, is_finished, sample_rate)
+        """
+        if self.model.tts_model_type != "custom_voice":
+            raise ValueError(
+                f"model with \ntokenizer_type: {self.model.tokenizer_type}\n"
+                f"tts_model_size: {self.model.tts_model_size}\n"
+                f"tts_model_type: {self.model.tts_model_type}\n"
+                "does not support generate_custom_voice_streaming"
+            )
+
+        texts = self._ensure_list(text)
+        languages = (
+            self._ensure_list(language)
+            if isinstance(language, list)
+            else ([language] * len(texts) if language is not None else ["Auto"] * len(texts))
+        )
+        speakers = self._ensure_list(speaker)
+        if self.model.tts_model_size in "0b6":
+            instruct = None
+        instructs = (
+            self._ensure_list(instruct)
+            if isinstance(instruct, list)
+            else ([instruct] * len(texts) if instruct is not None else [""] * len(texts))
+        )
+
+        if len(languages) == 1 and len(texts) > 1:
+            languages = languages * len(texts)
+        if len(speakers) == 1 and len(texts) > 1:
+            speakers = speakers * len(texts)
+        if len(instructs) == 1 and len(texts) > 1:
+            instructs = instructs * len(texts)
+
+        if not (len(texts) == len(languages) == len(speakers) == len(instructs)):
+            raise ValueError(
+                f"Batch size mismatch: text={len(texts)}, "
+                f"language={len(languages)}, speaker={len(speakers)}, "
+                f"instruct={len(instructs)}"
+            )
+
+        self._validate_languages(languages)
+        self._validate_speakers(speakers)
+
+        input_ids = self._tokenize_texts([self._build_assistant_text(t) for t in texts])
+
+        instruct_ids: list[torch.Tensor | None] = []
+        for ins in instructs:
+            if ins is None or ins == "":
+                instruct_ids.append(None)
+            else:
+                instruct_ids.append(self._tokenize_texts([self._build_instruct_text(ins)])[0])
+
+        gen_kwargs = self._merge_generate_kwargs(**kwargs)
+
+        # Use streaming generation
+        for audio_chunk, is_finished, sr in self.model.generate_streaming(
+            input_ids=input_ids,
+            instruct_ids=instruct_ids,
+            languages=languages,
+            speakers=speakers,
+            chunk_size=chunk_size,
+            left_context_size=left_context_size,
+            **gen_kwargs,
+        ):
+            # Convert tensor to numpy
+            if isinstance(audio_chunk, torch.Tensor):
+                audio_chunk = audio_chunk.cpu().numpy()
+            yield audio_chunk, is_finished, sr
+
+    @torch.inference_mode()
+    def generate_voice_design_streaming(
+        self,
+        text: str | list[str],
+        instruct: str | list[str],
+        language: str | list[str] = None,
+        chunk_size: int = 25,
+        left_context_size: int = 25,
+        **kwargs: Any,
+    ):
+        """
+        Streaming version of generate_voice_design. Yields audio chunks as they are generated.
+
+        Args:
+            text: Text(s) to synthesize.
+            instruct: Instruction text(s) describing the desired voice.
+            language: Language(s) for each sample.
+            chunk_size: Number of codec frames per audio chunk (default 25).
+            left_context_size: Context frames for smooth chunk boundaries (default 25).
+            **kwargs: Additional generation options.
+
+        Yields:
+            tuple[np.ndarray, bool, int]: (audio_chunk, is_finished, sample_rate)
+        """
+        if self.model.tts_model_type != "voice_design":
+            raise ValueError(
+                f"model with \ntokenizer_type: {self.model.tokenizer_type}\n"
+                f"tts_model_size: {self.model.tts_model_size}\n"
+                f"tts_model_type: {self.model.tts_model_type}\n"
+                "does not support generate_voice_design_streaming"
+            )
+
+        texts = self._ensure_list(text)
+        languages = (
+            self._ensure_list(language)
+            if isinstance(language, list)
+            else ([language] * len(texts) if language is not None else ["Auto"] * len(texts))
+        )
+        instructs = self._ensure_list(instruct)
+
+        if len(languages) == 1 and len(texts) > 1:
+            languages = languages * len(texts)
+        if len(instructs) == 1 and len(texts) > 1:
+            instructs = instructs * len(texts)
+
+        if not (len(texts) == len(languages) == len(instructs)):
+            raise ValueError(
+                f"Batch size mismatch: text={len(texts)}, language={len(languages)}, instruct={len(instructs)}"
+            )
+
+        self._validate_languages(languages)
+
+        input_ids = self._tokenize_texts([self._build_assistant_text(t) for t in texts])
+
+        instruct_ids = []
+        for ins in instructs:
+            if ins is None or ins == "":
+                instruct_ids.append(None)
+            else:
+                instruct_ids.append(self._tokenize_texts([self._build_instruct_text(ins)])[0])
+
+        gen_kwargs = self._merge_generate_kwargs(**kwargs)
+
+        for audio_chunk, is_finished, sr in self.model.generate_streaming(
+            input_ids=input_ids,
+            instruct_ids=instruct_ids,
+            languages=languages,
+            speakers=[None] * len(texts),
+            chunk_size=chunk_size,
+            left_context_size=left_context_size,
+            **gen_kwargs,
+        ):
+            if isinstance(audio_chunk, torch.Tensor):
+                audio_chunk = audio_chunk.cpu().numpy()
+            yield audio_chunk, is_finished, sr
+
+    @torch.inference_mode()
+    def generate_voice_clone_streaming(
+        self,
+        text: str | list[str],
+        language: str | list[str] = None,
+        ref_audio: AudioLike | list[AudioLike] | None = None,
+        ref_text: str | list[str | None] | None = None,
+        x_vector_only_mode: bool | list[bool] = False,
+        voice_clone_prompt: dict[str, Any] | list[VoiceClonePromptItem] | None = None,
+        chunk_size: int = 25,
+        left_context_size: int = 25,
+        **kwargs: Any,
+    ):
+        """
+        Streaming version of generate_voice_clone. Yields audio chunks as they are generated.
+
+        Args:
+            text: Text(s) to synthesize.
+            language: Language(s) for each sample.
+            ref_audio: Reference audio(s) for voice cloning.
+            ref_text: Reference text(s) for ICL mode.
+            x_vector_only_mode: If True, only speaker embedding is used.
+            voice_clone_prompt: Pre-computed voice clone prompt items.
+            chunk_size: Number of codec frames per audio chunk (default 25).
+            left_context_size: Context frames for smooth chunk boundaries (default 25).
+            **kwargs: Additional generation options.
+
+        Yields:
+            tuple[np.ndarray, bool, int]: (audio_chunk, is_finished, sample_rate)
+        """
+        if self.model.tts_model_type != "base":
+            raise ValueError(
+                f"model with \ntokenizer_type: {self.model.tokenizer_type}\n"
+                f"tts_model_size: {self.model.tts_model_size}\n"
+                f"tts_model_type: {self.model.tts_model_type}\n"
+                "does not support generate_voice_clone_streaming"
+            )
+
+        texts = self._ensure_list(text)
+        languages = (
+            self._ensure_list(language)
+            if isinstance(language, list)
+            else ([language] * len(texts) if language is not None else ["Auto"] * len(texts))
+        )
+        if len(languages) == 1 and len(texts) > 1:
+            languages = languages * len(texts)
+        if len(texts) != len(languages):
+            raise ValueError(f"Batch size mismatch: text={len(texts)}, language={len(languages)}")
+
+        self._validate_languages(languages)
+
+        if voice_clone_prompt is None:
+            if ref_audio is None:
+                sample_rate = int(self.model.speaker_encoder_sample_rate)
+                ref_audio = (np.zeros(sample_rate, dtype=np.float32), sample_rate)
+                logger.warning("ref_audio is not provided. Using silent clip.")
+            prompt_items = self.create_voice_clone_prompt(
+                ref_audio=ref_audio, ref_text=ref_text, x_vector_only_mode=x_vector_only_mode
+            )
+            if len(prompt_items) == 1 and len(texts) > 1:
+                prompt_items = prompt_items * len(texts)
+            if len(prompt_items) != len(texts):
+                raise ValueError(f"Batch size mismatch: prompt={len(prompt_items)}, text={len(texts)}")
+            voice_clone_prompt_dict = self._prompt_items_to_voice_clone_prompt(prompt_items)
+            ref_texts_for_ids = [it.ref_text for it in prompt_items]
+        else:
+            if isinstance(voice_clone_prompt, list):
+                prompt_items = voice_clone_prompt
+                if len(prompt_items) == 1 and len(texts) > 1:
+                    prompt_items = prompt_items * len(texts)
+                if len(prompt_items) != len(texts):
+                    raise ValueError(f"Batch size mismatch: prompt={len(prompt_items)}, text={len(texts)}")
+                voice_clone_prompt_dict = self._prompt_items_to_voice_clone_prompt(prompt_items)
+                ref_texts_for_ids = [it.ref_text for it in prompt_items]
+            else:
+                voice_clone_prompt_dict = voice_clone_prompt
+                ref_texts_for_ids = None
+
+        input_texts = [self._build_assistant_text(t) for t in texts]
+        input_ids = self._tokenize_texts(input_texts)
+
+        ref_ids = None
+        if ref_texts_for_ids is not None:
+            ref_ids = []
+            for i, rt in enumerate(ref_texts_for_ids):
+                if rt is None or rt == "":
+                    ref_ids.append(None)
+                else:
+                    ref_tok = self._tokenize_texts([self._build_ref_text(rt)])[0]
+                    ref_ids.append(ref_tok)
+
+        gen_kwargs = self._merge_generate_kwargs(**kwargs)
+
+        for audio_chunk, is_finished, sr in self.model.generate_streaming(
+            input_ids=input_ids,
+            ref_ids=ref_ids,
+            voice_clone_prompt=voice_clone_prompt_dict,
+            languages=languages,
+            chunk_size=chunk_size,
+            left_context_size=left_context_size,
+            **gen_kwargs,
+        ):
+            if isinstance(audio_chunk, torch.Tensor):
+                audio_chunk = audio_chunk.cpu().numpy()
+            yield audio_chunk, is_finished, sr
