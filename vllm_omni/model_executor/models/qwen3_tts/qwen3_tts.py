@@ -139,7 +139,6 @@ class Qwen3TTSModelForGeneration(nn.Module):
             if "left_context_size" in runtime_additional_information
             else 25
         )
-        print(f"chunk_size : {chunk_size}, {runtime_additional_information}")
         for key, value in runtime_additional_information.items():
             if isinstance(value, list) and len(value) > 0:
                 runtime_additional_information[key] = value[0]
@@ -277,7 +276,8 @@ class Qwen3TTSModelForGeneration(nn.Module):
 
             if audio_chunks:
                 full_audio = np.concatenate(audio_chunks)
-                audio_tensor = torch.from_numpy(full_audio).float()
+                # Use .clone().contiguous() to ensure safe serialization (avoid stride-0 issues)
+                audio_tensor = torch.from_numpy(full_audio).float().clone().contiguous()
                 return OmniOutput(
                     text_hidden_states=None,
                     multimodal_outputs={
@@ -298,10 +298,15 @@ class Qwen3TTSModelForGeneration(nn.Module):
             state["is_finished"] = is_finished
 
             # Convert chunk to tensor
+            # Use .clone().contiguous() to ensure safe serialization (avoid stride-0 issues)
             if isinstance(audio_chunk, np.ndarray):
-                audio_tensor = torch.from_numpy(audio_chunk).float()
+                audio_tensor = torch.from_numpy(audio_chunk).float().clone().contiguous()
             else:
-                audio_tensor = audio_chunk.float()
+                audio_tensor = audio_chunk.float().clone().contiguous()
+
+            # Clean up state immediately when finished to prevent memory leaks
+            if is_finished:
+                del self._streaming_state[request_id]
 
             return OmniOutput(
                 text_hidden_states=None,
@@ -313,14 +318,14 @@ class Qwen3TTSModelForGeneration(nn.Module):
             )
         except StopIteration:
             # Generator exhausted
-            state["is_finished"] = True
             audio_chunks = state["audio_chunks"]
             sr = state["sample_rate"]
             del self._streaming_state[request_id]
 
             if audio_chunks:
                 full_audio = np.concatenate(audio_chunks)
-                audio_tensor = torch.from_numpy(full_audio).float()
+                # Use .clone().contiguous() to ensure safe serialization (avoid stride-0 issues)
+                audio_tensor = torch.from_numpy(full_audio).float().clone().contiguous()
                 return OmniOutput(
                     text_hidden_states=None,
                     multimodal_outputs={
