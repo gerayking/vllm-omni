@@ -21,6 +21,10 @@ class OpenAICreateSpeechRequest(BaseModel):
         ge=0.25,
         le=4.0,
     )
+    stream: bool = Field(
+        default=False,
+        description="Enable streaming audio output. When true, audio chunks are sent as they are generated.",
+    )
     stream_format: Literal["sse", "audio"] | None = "audio"
 
     # Qwen3-TTS specific parameters
@@ -48,13 +52,17 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description="Maximum tokens to generate",
     )
-
-    @field_validator("stream_format")
-    @classmethod
-    def validate_stream_format(cls, v: str) -> str:
-        if v == "sse":
-            raise ValueError("'sse' is not a supported stream_format yet. Please use 'audio'.")
-        return v
+    chunk_size: int | None = Field(
+        default=None,
+        ge=1,
+        le=100,
+        description="Codec frames per chunk for streaming (default: 5)",
+    )
+    left_context_size: int | None = Field(
+        default=None,
+        ge=0,
+        description="Left context frames for streaming chunk boundary smoothing (default: 25)",
+    )
 
 
 class CreateAudio(BaseModel):

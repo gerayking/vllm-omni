@@ -184,6 +184,16 @@ class OmniRequestState(RequestState):
         # Consolidate accumulated tensors when finishing.
         if finished:
             self._consolidate_multimodal_tensors()
+        elif self.mm_accumulated is not None:
+            # For streaming (non-finished) outputs, emit the current accumulated
+            # multimodal data as a delta and clear for the next chunk.
+            # Save a snapshot, then clear so next step only gets new data.
+            # _new_completion_output reads from self.mm_accumulated, so we
+            # leave it in place until after the output is built, then clear.
+            self._streaming_mm_snapshot = self.mm_accumulated
+            self._clear_mm_after_output = True
+        else:
+            self._clear_mm_after_output = False
 
         if self.stream_interval > 1:
             assert self.detokenizer is not None
@@ -207,6 +217,12 @@ class OmniRequestState(RequestState):
 
         request_id = self.request_id
         output = self._new_completion_output(new_token_ids, finish_reason, stop_reason, routed_experts)
+
+        # Clear accumulated multimodal data after building the output for
+        # streaming (non-finished) steps so each output is a delta.
+        if getattr(self, "_clear_mm_after_output", False):
+            self.mm_accumulated = None
+            self._clear_mm_after_output = False
 
         if self.parent_req is None:
             outputs = [output]

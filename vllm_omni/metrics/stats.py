@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
+import torch
 from vllm.logger import init_logger
 
 from vllm_omni.metrics.utils import _build_field_defs, _build_row, _format_table
@@ -226,7 +227,18 @@ class OrchestratorAggregator:
             and finished
             and (multimodal_output := output_to_yield.multimodal_output.get("audio")) is not None
         ):
-            nframes = int(multimodal_output[-1].shape[0])
+            try:
+                if isinstance(multimodal_output, torch.Tensor):
+                    # Single tensor: use its total number of elements as nframes
+                    nframes = int(multimodal_output.numel())
+                elif isinstance(multimodal_output, list) and len(multimodal_output) > 0:
+                    last = multimodal_output[-1]
+                    nframes = int(last.numel()) if isinstance(last, torch.Tensor) else 0
+                else:
+                    nframes = 0
+            except Exception:
+                logger.warning("Failed to compute audio nframes for request %s", request_id)
+                nframes = 0
             stage_events_for_req = self.stage_events.get(request_id, [])
             if stage_events_for_req:
                 for stage_event in stage_events_for_req:

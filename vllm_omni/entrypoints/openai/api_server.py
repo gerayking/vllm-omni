@@ -795,6 +795,24 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
             )
         return base_server.create_error_response(message="The model does not support Speech API")
     try:
+        if request.stream:
+            generator = handler.create_speech_streaming(request, raw_request)
+            if request.stream_format == "sse":
+                media_type = "text/event-stream"
+            else:
+                # Map response_format to media type
+                _audio_media_types = {
+                    "wav": "audio/wav",
+                    "pcm": "audio/pcm",
+                    "flac": "audio/flac",
+                    "mp3": "audio/mpeg",
+                    "aac": "audio/aac",
+                    "opus": "audio/ogg",
+                }
+                media_type = _audio_media_types.get(
+                    request.response_format or "wav", "audio/wav"
+                )
+            return StreamingResponse(content=generator, media_type=media_type)
         return await handler.create_speech(request, raw_request)
     except Exception as e:
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e

@@ -354,8 +354,23 @@ class OmniGenerationScheduler(VLLMScheduler):
             routed_experts = None
 
             # Diffusion request: completes in one step; mark finished and free resources
-            if request.status == RequestStatus.FINISHED_STOPPED or (
-                self.omni_connector is None and request.num_computed_tokens >= request.num_prompt_tokens
+            # For streaming TTS: check the model output for a "finished" flag.
+            # If the model indicates streaming is still in progress (finished=False),
+            # do NOT mark the request as finished — keep it running for the next chunk.
+            streaming_not_finished = False
+            if pooler_output is not None and isinstance(pooler_output, dict):
+                finished_flag = pooler_output.get("finished")
+                if finished_flag is not None:
+                    import torch
+                    if isinstance(finished_flag, torch.Tensor):
+                        streaming_not_finished = not bool(finished_flag.item())
+                    else:
+                        streaming_not_finished = not bool(finished_flag)
+
+            if not streaming_not_finished and (
+                request.status == RequestStatus.FINISHED_STOPPED or (
+                    self.omni_connector is None and request.num_computed_tokens >= request.num_prompt_tokens
+                )
             ):
                 request.status = RequestStatus.FINISHED_STOPPED
                 # Optional: set a stop_reason for front-end clarity

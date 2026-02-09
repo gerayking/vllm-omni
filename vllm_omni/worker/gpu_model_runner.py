@@ -781,13 +781,20 @@ class OmniGPUModelRunner(GPUModelRunner):
             logger.error(f"Error decoding prompt_embeds / additional_information: {e}")
 
     def _gather_runtime_additional_information(self) -> list[dict]:
-        """Gather per-request additional_information stored in request state in batch order."""
+        """Gather per-request additional_information stored in request state in batch order.
+
+        Returns a deep copy of each request's info dict so that downstream
+        consumers (e.g. model ``forward()`` using ``.pop()``) do not mutate
+        the original stored state.  This is critical for streaming scenarios
+        where the same request is scheduled across multiple steps.
+        """
+        import copy
         per_req_runtime_info = []
         for req_id in self.input_batch.req_ids:
             req_state = self.requests.get(req_id)
             info = getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
             if info and isinstance(info, dict):
-                per_req_runtime_info.append(info)
+                per_req_runtime_info.append(copy.deepcopy(info))
                 if "thinker_reply_part_per_request" in info:
                     q = info["thinker_reply_part_per_request"]
                     if hasattr(q, "shape"):

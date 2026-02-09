@@ -73,6 +73,64 @@ class AudioMixin:
 
         return AudioResponse(audio_data=audio_data, media_type=media_type)
 
+    def encode_audio_chunk(
+        self,
+        audio_chunk: np.ndarray,
+        sample_rate: int,
+        response_format: str = "pcm",
+    ) -> bytes:
+        """Encode a single audio chunk to bytes.
+
+        For PCM format, directly converts numpy array to int16 bytes (zero-copy).
+        For other formats, uses soundfile to encode with proper headers.
+
+        Args:
+            audio_chunk: Audio samples as numpy array (float32).
+            sample_rate: Audio sample rate in Hz.
+            response_format: Target audio format.
+
+        Returns:
+            Encoded audio bytes for this chunk.
+        """
+        if response_format == "pcm":
+            # Direct int16 conversion for minimal latency
+            if np.issubdtype(audio_chunk.dtype, np.floating):
+                pcm_data = np.clip(audio_chunk, -1.0, 1.0)
+                pcm_data = (pcm_data * 32767).astype(np.int16)
+            else:
+                pcm_data = audio_chunk.astype(np.int16)
+            return pcm_data.tobytes()
+
+        if soundfile is None:
+            raise ImportError(
+                "soundfile is required for audio generation. "
+                "Please install it with: pip install soundfile"
+            )
+
+        supported_formats = {
+            "wav": ("WAV", {}),
+            "flac": ("FLAC", {}),
+            "mp3": ("MP3", {}),
+            "aac": ("AAC", {}),
+            "opus": ("OGG", {"subtype": "OPUS"}),
+        }
+
+        if response_format not in supported_formats:
+            logger.warning(
+                f"Unsupported chunk format '{response_format}', "
+                "defaulting to 'wav'."
+            )
+            response_format = "wav"
+
+        soundfile_format, kwargs = supported_formats[response_format]
+
+        with BytesIO() as buffer:
+            soundfile.write(
+                buffer, audio_chunk, sample_rate,
+                format=soundfile_format, **kwargs,
+            )
+            return buffer.getvalue()
+
     def _apply_speed_adjustment(self, audio_tensor: np.ndarray, speed: float, sample_rate: int):
         """Apply speed adjustment to the audio tensor while preserving pitch."""
         if speed == 1.0:
