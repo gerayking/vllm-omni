@@ -225,8 +225,13 @@ class OrchestratorAggregator:
             output_to_yield.final_output_type == "audio"
             and finished
             and (multimodal_output := output_to_yield.multimodal_output.get("audio")) is not None
+            and len(multimodal_output) > 0
         ):
-            nframes = int(multimodal_output[-1].shape[0])
+            last_output = multimodal_output[-1]
+            # Handle case where last_output might be an empty tuple or doesn't have valid shape
+            if not hasattr(last_output, "shape") or len(last_output.shape) == 0:
+                return
+            nframes = int(last_output.shape[0])
             stage_events_for_req = self.stage_events.get(request_id, [])
             if stage_events_for_req:
                 for stage_event in stage_events_for_req:

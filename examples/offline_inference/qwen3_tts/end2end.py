@@ -10,7 +10,7 @@ import json
 import os
 import time
 from typing import NamedTuple
-
+import torch
 import soundfile as sf
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -306,41 +306,43 @@ def run_streaming_generation_test(omni, query_result, sampling_params_list, outp
     for stage_outputs in omni_generator:
         chunk_start_time = time.time()
 
-        for output in stage_outputs.request_output:
-            request_id = output.request_id
-            audio_tensor = output.multimodal_output["audio"]
-            audio_samplerate = output.multimodal_output["sr"].item()
+        request_id = stage_outputs.request_id
+        multimodal_output = stage_outputs.multimodal_output
+        if not multimodal_output or "audio" not in multimodal_output:
+            continue
+        audio_tensor = multimodal_output["audio"]
+        audio_samplerate = multimodal_output.get("sr", torch.tensor(12000)).item()
 
-            # Convert to numpy array
-            audio_numpy = audio_tensor.float().detach().cpu().numpy()
-            if audio_numpy.ndim > 1:
-                audio_numpy = audio_numpy.flatten()
+        # Convert to numpy array
+        audio_numpy = audio_tensor.float().detach().cpu().numpy()
+        if audio_numpy.ndim > 1:
+            audio_numpy = audio_numpy.flatten()
 
-            # Save chunk audio
-            chunk_output_wav = os.path.join(output_dir, f"streaming_chunk_{chunk_idx:03d}_req_{request_id}.wav")
-            sf.write(chunk_output_wav, audio_numpy, samplerate=audio_samplerate, format="WAV")
+        # Save chunk audio
+        chunk_output_wav = os.path.join(output_dir, f"streaming_chunk_{chunk_idx:03d}_req_{request_id}.wav")
+        sf.write(chunk_output_wav, audio_numpy, samplerate=audio_samplerate, format="WAV")
 
-            # Record chunk information
-            chunk_info = {
-                "chunk_idx": chunk_idx,
-                "request_id": request_id,
-                "audio_length_samples": len(audio_numpy),
-                "audio_duration_seconds": len(audio_numpy) / audio_samplerate,
-                "processing_time": time.time() - chunk_start_time,
-                "output_file": chunk_output_wav,
-            }
+        # Record chunk information
+        chunk_info = {
+            "chunk_idx": chunk_idx,
+            "request_id": request_id,
+            "audio_length_samples": len(audio_numpy),
+            "audio_duration_seconds": len(audio_numpy) / audio_samplerate,
+            "processing_time": time.time() - chunk_start_time,
+            "output_file": chunk_output_wav,
+        }
 
-            test_results["chunks"].append(chunk_info)
-            test_results["total_audio_generated"] += len(audio_numpy)
+        test_results["chunks"].append(chunk_info)
+        test_results["total_audio_generated"] += len(audio_numpy)
 
-            print(
-                f"Chunk {chunk_idx:3d} | Request {request_id} | "
-                f"Samples: {len(audio_numpy):6d} | "
-                f"Duration: {len(audio_numpy) / audio_samplerate:.2f}s | "
-                f"Processing: {chunk_info['processing_time']:.3f}s"
-            )
+        print(
+            f"Chunk {chunk_idx:3d} | Request {request_id} | "
+            f"Samples: {len(audio_numpy):6d} | "
+            f"Duration: {len(audio_numpy) / audio_samplerate:.2f}s | "
+            f"Processing: {chunk_info['processing_time']:.3f}s"
+        )
 
-            chunk_idx += 1
+        chunk_idx += 1
 
     test_results["end_time"] = time.time()
     test_results["total_chunks"] = chunk_idx
@@ -425,21 +427,23 @@ def main(args):
     else:
         omni_generator = omni.generate(query_result.inputs, sampling_params_list)
         for stage_outputs in omni_generator:
-            for output in stage_outputs.request_output:
-                request_id = output.request_id
-                audio_tensor = output.multimodal_output["audio"]
-                output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
-                audio_samplerate = output.multimodal_output["sr"].item()
-                # Convert to numpy array and ensure correct format
-                audio_numpy = audio_tensor.float().detach().cpu().numpy()
+            request_id = stage_outputs.request_id
+            multimodal_output = stage_outputs.multimodal_output
+            if not multimodal_output or "audio" not in multimodal_output:
+                continue
+            audio_tensor = multimodal_output["audio"]
+            output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
+            audio_samplerate = multimodal_output.get("sr", torch.tensor(12000)).item()
+            # Convert to numpy array and ensure correct format
+            audio_numpy = audio_tensor.float().detach().cpu().numpy()
 
-                # Ensure audio is 1D (flatten if needed)
-                if audio_numpy.ndim > 1:
-                    audio_numpy = audio_numpy.flatten()
+            # Ensure audio is 1D (flatten if needed)
+            if audio_numpy.ndim > 1:
+                audio_numpy = audio_numpy.flatten()
 
-                # Save audio file with explicit WAV format
-                sf.write(output_wav, audio_numpy, samplerate=audio_samplerate, format="WAV")
-                print(f"Request ID: {request_id}, Saved audio to {output_wav}")
+            # Save audio file with explicit WAV format
+            sf.write(output_wav, audio_numpy, samplerate=audio_samplerate, format="WAV")
+            print(f"Request ID: {request_id}, Saved audio to {output_wav}")
 
 
 def parse_args():

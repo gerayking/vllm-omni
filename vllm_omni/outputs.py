@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Any
-
+import queue, threading
 import torch
 from PIL import Image
 from vllm.outputs import RequestOutput
@@ -128,6 +128,15 @@ class OmniRequestOutput:
         For diffusion outputs, this returns the local _multimodal_output field.
         """
         if self.request_output is not None:
+            # Handle case where request_output is a list (e.g., from batched generation)
+            if isinstance(self.request_output, list):
+                for req_out in self.request_output:
+                    if hasattr(req_out, "outputs") and req_out.outputs:
+                        for output in req_out.outputs:
+                            mm = getattr(output, "multimodal_output", None)
+                            if mm:
+                                return mm
+                return {}
             # Check completion outputs first (where multimodal_output is attached)
             if self.request_output.outputs:
                 for output in self.request_output.outputs:
