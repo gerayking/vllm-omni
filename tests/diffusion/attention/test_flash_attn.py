@@ -297,6 +297,64 @@ def test_flash_attn_func_preferred_over_varlen():
     print("✓ flash_attn_func forward works correctly!")
 
 
+def test_flash_attn_uses_precomputed_varlen_layout(monkeypatch):
+    """Precomputed varlen layout should avoid generic mask parsing."""
+    from vllm_omni.diffusion.attention.backends.abstract import VarlenAttentionLayout
+
+    captured = {}
+
+    def fake_varlen_func(q, k, v, **kwargs):
+        captured["q_shape"] = tuple(q.shape)
+        captured["cu_seqlens_q"] = kwargs["cu_seqlens_q"].tolist()
+        captured["max_seqlen_q"] = kwargs["max_seqlen_q"]
+        return torch.ones_like(q)
+
+    def fail_generic_unpad(*args, **kwargs):
+        raise AssertionError("generic mask unpad should not run")
+
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "flash_attn_func", None)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen_func)
+    monkeypatch.setattr(fa, "_upad_input", fail_generic_unpad)
+
+    impl = FlashAttentionImpl(num_heads=2, head_size=4, softmax_scale=0.5, causal=False)
+    q = torch.randn(2, 5, 2, 4, dtype=torch.bfloat16)
+    k = torch.randn(2, 5, 2, 4, dtype=torch.bfloat16)
+    v = torch.randn(2, 5, 2, 4, dtype=torch.bfloat16)
+    indices = torch.tensor([0, 1, 2, 5, 6, 7, 8], dtype=torch.int64)
+    cu_seqlens = torch.tensor([0, 3, 7], dtype=torch.int32)
+    layout = VarlenAttentionLayout(
+        indices_q=indices,
+        indices_k=indices,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=4,
+        max_seqlen_k=4,
+        batch_size=2,
+        padded_q_len=5,
+        padded_k_len=5,
+    )
+    metadata = AttentionMetadata(
+        attn_mask=torch.tensor(
+            [
+                [True, True, True, False, False],
+                [True, True, True, True, False],
+            ]
+        ),
+        extra={"varlen": layout},
+    )
+
+    out = impl.forward_cuda(q, k, v, metadata)
+
+    assert out.shape == q.shape
+    assert captured == {
+        "q_shape": (7, 2, 4),
+        "cu_seqlens_q": [0, 3, 7],
+        "max_seqlen_q": 4,
+    }
+    assert torch.all(out.reshape(-1, 2, 4)[indices] == 1)
+
+
 if __name__ == "__main__":
     print("Running FlashAttention Padding Tests...")
     print("=" * 60)
