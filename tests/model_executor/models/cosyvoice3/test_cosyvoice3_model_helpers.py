@@ -518,3 +518,54 @@ def test_gpu_ar_model_runner_repairs_async_placeholders_for_model_sampler():
     assert runner.input_batch.async_copy_ready_event.synced is True
     assert runner.input_batch.update_async_called is True
     assert seen_histories == [[[11, 29]]]
+
+
+def test_cosyvoice3_flow_dtype_env_defaults_to_fp32(monkeypatch):
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import _cosyvoice3_flow_dtype
+
+    monkeypatch.delenv("COSYVOICE3_FLOW_DTYPE", raising=False)
+
+    assert _cosyvoice3_flow_dtype() == torch.float32
+
+
+def test_cosyvoice3_flow_dtype_env_accepts_fp16(monkeypatch):
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import _cosyvoice3_flow_dtype
+
+    monkeypatch.setenv("COSYVOICE3_FLOW_DTYPE", "fp16")
+
+    assert _cosyvoice3_flow_dtype() == torch.float16
+
+
+def test_resolve_flow_estimator_onnx_skips_fp32_fallback_for_fp16_flow(monkeypatch, tmp_path):
+    CosyVoice3Model, _ = _cosyvoice3_model_and_runner()
+    model = SimpleNamespace(
+        model_dir=str(tmp_path),
+        config=SimpleNamespace(
+            flow_estimator_onnx_path="missing.fp16.onnx",
+            flow_estimator_onnx_path_fp32="flow.decoder.estimator.fp32.onnx",
+            flow_estimator_onnx_repo=None,
+        ),
+    )
+    (tmp_path / "flow.decoder.estimator.fp32.onnx").write_bytes(b"onnx")
+    monkeypatch.delenv("COSYVOICE3_ESTIMATOR_ONNX", raising=False)
+    monkeypatch.setenv("COSYVOICE3_FLOW_DTYPE", "fp16")
+
+    assert CosyVoice3Model._resolve_flow_estimator_onnx(model) is None
+
+
+def test_resolve_flow_estimator_onnx_allows_fp32_fallback_by_default(monkeypatch, tmp_path):
+    CosyVoice3Model, _ = _cosyvoice3_model_and_runner()
+    model = SimpleNamespace(
+        model_dir=str(tmp_path),
+        config=SimpleNamespace(
+            flow_estimator_onnx_path="missing.fp16.onnx",
+            flow_estimator_onnx_path_fp32="flow.decoder.estimator.fp32.onnx",
+            flow_estimator_onnx_repo=None,
+        ),
+    )
+    fp32_path = tmp_path / "flow.decoder.estimator.fp32.onnx"
+    fp32_path.write_bytes(b"onnx")
+    monkeypatch.delenv("COSYVOICE3_ESTIMATOR_ONNX", raising=False)
+    monkeypatch.delenv("COSYVOICE3_FLOW_DTYPE", raising=False)
+
+    assert CosyVoice3Model._resolve_flow_estimator_onnx(model) == str(fp32_path)

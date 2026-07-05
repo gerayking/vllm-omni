@@ -902,6 +902,17 @@ class CosyVoice3Model(
             except Exception as exc:  # pragma: no cover - network/repo issues
                 logger.warning("CosyVoice3 code2wav: could not fetch fp16 estimator ONNX from %s (%s)", repo, exc)
 
+        from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import (
+            _cosyvoice3_flow_dtype,
+        )
+
+        if _cosyvoice3_flow_dtype() == torch.float16:
+            logger.warning(
+                "CosyVoice3 code2wav: fp16 flow requested but no fp16 estimator ONNX is available; "
+                "keeping torch estimator instead of falling back to fp32 TensorRT"
+            )
+            return None
+
         fp32_name = getattr(self.config, "flow_estimator_onnx_path_fp32", "flow.decoder.estimator.fp32.onnx")
         local_fp32 = os.path.join(self.model_dir, fp32_name)
         if os.path.exists(local_fp32):
