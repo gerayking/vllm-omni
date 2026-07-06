@@ -135,7 +135,7 @@ class ConditionalCFM(BASECFM):
             if step < len(t_span) - 1:
                 dt = t_span[step + 1] - t
 
-        return sol[-1].float()
+        return sol[-1]
 
     def forward_estimator(self, x, mask, mu, t, spks, cond):
         if isinstance(self.estimator, torch.nn.Module):
@@ -335,4 +335,4 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
 
         feat = feat[:, :, mel_len1:]
         assert feat.shape[2] == mel_len2
-        return feat.float(), None
+        return feat, None

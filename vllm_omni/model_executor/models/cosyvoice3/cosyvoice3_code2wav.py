@@ -11,6 +11,8 @@ This module contains the code2wav (token-to-waveform) stage which uses:
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -30,6 +32,24 @@ from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreL
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 
 logger = init_logger(__name__)
+
+
+def _cosyvoice3_flow_dtype() -> torch.dtype:
+    """Requested dtype for the CosyVoice3 flow model.
+
+    Default is fp32 for compatibility. ``fp16`` is an opt-in path used for
+    flow-matching experiments and profiling.
+    """
+    value = os.environ.get("COSYVOICE3_FLOW_DTYPE", "fp32").strip().lower()
+    if value in ("", "fp32", "float32"):
+        return torch.float32
+    if value in ("fp16", "float16"):
+        return torch.float16
+    logger.warning(
+        "CosyVoice3 code2wav: unsupported COSYVOICE3_FLOW_DTYPE=%r; using fp32",
+        value,
+    )
+    return torch.float32
 
 
 class CosyVoice3Code2Wav(nn.Module):
@@ -301,13 +321,12 @@ class CosyVoice3Code2Wav(nn.Module):
             model_dir: Model directory containing flow.pt and hift.pt
             device: Device to load weights to
         """
-        import os
-
         # Load flow weights
         flow_path = os.path.join(model_dir, "flow.pt")
         self.flow_model.load_state_dict(torch.load(flow_path, map_location=device), strict=True)
-        self.flow_model.to(device).eval()
-        logger.info(f"Loaded flow weights from {flow_path}")
+        flow_dtype = _cosyvoice3_flow_dtype()
+        self.flow_model.to(device=device, dtype=flow_dtype).eval()
+        logger.info("Loaded flow weights from %s (dtype=%s)", flow_path, flow_dtype)
 
         # Load hift weights
         hift_path = os.path.join(model_dir, "hift.pt")
@@ -315,5 +334,5 @@ class CosyVoice3Code2Wav(nn.Module):
             k.replace("generator.", ""): v for k, v in torch.load(hift_path, map_location=device).items()
         }
         self.hift.load_state_dict(hift_state_dict, strict=True)
-        self.hift.to(device).eval()
+        self.hift.to(device=device, dtype=torch.float32).eval()
         logger.info(f"Loaded hift weights from {hift_path}")

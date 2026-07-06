@@ -248,6 +248,42 @@ class TestCFM:
 
         assert out.shape == mu.shape
 
+    @pytest.mark.core_model
+    @pytest.mark.cpu
+    def test_causal_conditional_cfm_preserves_fp16_output_dtype(self, dummy_estimator):
+        """Flow solver should not force fp16 mel samples back to fp32."""
+        from omegaconf import DictConfig
+
+        from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import CausalConditionalCFM
+
+        cfm_params = DictConfig(
+            {
+                "sigma_min": 1e-6,
+                "solver": "euler",
+                "t_scheduler": "linear",
+                "training_cfg_rate": 0.2,
+                "inference_cfg_rate": 0.7,
+            }
+        )
+        cfm = CausalConditionalCFM(
+            in_channels=80,
+            cfm_params=cfm_params,
+            n_spks=1,
+            spk_emb_dim=80,
+            estimator=dummy_estimator,
+        )
+
+        batch, mel_dim, seq_len = 1, 80, 8
+        mu = torch.randn(batch, mel_dim, seq_len, dtype=torch.float16)
+        mask = torch.ones(batch, 1, seq_len, dtype=torch.float16)
+        spks = torch.randn(batch, 80, dtype=torch.float16)
+        cond = torch.randn(batch, mel_dim, seq_len, dtype=torch.float16)
+
+        out, _ = cfm(mu, mask, n_timesteps=2, spks=spks, cond=cond)
+
+        assert out.shape == mu.shape
+        assert out.dtype == torch.float16
+
 
 class TestSDPAFallback:
     """Test SDPA fallback for float32 inputs."""
@@ -275,6 +311,51 @@ class TestSDPAFallback:
 
         assert out.shape == (batch, seq_len, heads, dim)
         assert out.dtype == torch.float32
+
+    @pytest.mark.core_model
+    @pytest.mark.cpu
+    def test_fa3_float16_uses_sdpa_fallback(self, monkeypatch):
+        """FA3 builds without fp16 support should not receive fp16 q/k/v."""
+        from vllm_omni.diffusion.attention import layer as attention_layer
+        from vllm_omni.diffusion.attention.backends.utils import fa as fa_utils
+        from vllm_omni.diffusion.attention.layer import Attention
+
+        class _DummyFA3:
+            __module__ = "fa3_fwd_interface"
+
+            def __call__(self, *args, **kwargs):
+                raise AssertionError("fp16 should have used SDPA fallback")
+
+        class _FlashImpl:
+            def forward(self, *args, **kwargs):
+                raise AssertionError("fp16 should have used SDPA fallback")
+
+        class _SDPAImpl:
+            def __init__(self):
+                self.called = False
+
+            def forward(self, query, key, value, attn_metadata):
+                self.called = True
+                return torch.zeros_like(query)
+
+        class _FlashBackend:
+            @staticmethod
+            def get_name():
+                return "FLASH_ATTN"
+
+        monkeypatch.setattr(fa_utils, "flash_attn_func", _DummyFA3())
+        attn = object.__new__(Attention)
+        attn.attn_backend = _FlashBackend
+        attn.attention = _FlashImpl()
+        attn.backend_pref = "FLASH_ATTN"
+        attn.sdpa_fallback = _SDPAImpl()
+
+        q = torch.ones((1, 4, 2, 64), dtype=torch.float16)
+        out = attention_layer.Attention._run_local_attention(attn, q, q, q, None)
+
+        assert out.shape == q.shape
+        assert out.dtype == torch.float16
+        assert attn.sdpa_fallback.called is True
 
 
 def test_code2wav_forward_finalizes_hift_tail():
@@ -311,3 +392,21 @@ def test_code2wav_forward_finalizes_hift_tail():
     assert out.shape == (1, 1, 8)
     assert model.hift.finalize_calls == [True]
     assert forward_mel_calls[0]["token_offset_tokens"] == 0
+
+
+def test_code2wav_load_weights_applies_fp16_flow_dtype(monkeypatch, tmp_path):
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
+
+    model = object.__new__(CosyVoice3Code2Wav)
+    nn.Module.__init__(model)
+    model.flow_model = nn.Linear(2, 2, bias=False).float()
+    model.hift = nn.Linear(2, 2, bias=False).float()
+
+    torch.save(model.flow_model.state_dict(), tmp_path / "flow.pt")
+    torch.save(model.hift.state_dict(), tmp_path / "hift.pt")
+    monkeypatch.setenv("COSYVOICE3_FLOW_DTYPE", "fp16")
+
+    model.load_weights(str(tmp_path), torch.device("cpu"))
+
+    assert next(model.flow_model.parameters()).dtype == torch.float16
+    assert next(model.hift.parameters()).dtype == torch.float32

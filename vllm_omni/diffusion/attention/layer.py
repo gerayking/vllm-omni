@@ -37,6 +37,13 @@ def _try_extract_layer_index(prefix: str) -> int | None:
         return None
 
 
+def _flash_attention_module_name() -> str:
+    from vllm_omni.diffusion.attention.backends.utils import fa as fa_utils
+
+    flash_func = fa_utils.flash_attn_func or fa_utils.flash_attn_varlen_func
+    return getattr(flash_func, "__module__", "") if flash_func is not None else ""
+
+
 class Attention(nn.Module):
     def __init__(
         self,
@@ -286,6 +293,17 @@ class Attention(nn.Module):
             logger.warning_once(
                 f"Only SDPA supports float32. Overriding user config {type(self.attention)} "
                 f"attention_backend='{self.backend_pref}' to 'sdpa' for dtype={query.dtype}."
+            )
+            return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+        if (
+            query.dtype == torch.float16
+            and self.attn_backend.get_name() == "FLASH_ATTN"
+            and _flash_attention_module_name() in ("fa3_fwd_interface", "flash_attn_interface")
+        ):
+            logger.warning_once(
+                f"Selected FlashAttention module does not support fp16. Overriding user config "
+                f"{type(self.attention)} attention_backend='{self.backend_pref}' to 'sdpa' "
+                f"for dtype={query.dtype}."
             )
             return self.sdpa_fallback.forward(query, key, value, attn_metadata)
 
