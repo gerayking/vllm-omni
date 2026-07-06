@@ -1041,6 +1041,12 @@ class CosyVoice3Model(
                 payload = to_struct(raw)
                 meta = payload.meta
                 embed = payload.embed
+                speaker = payload.speaker
+                spk_id = None
+                if isinstance(speaker, str) and speaker:
+                    spk_id = speaker
+                elif isinstance(speaker, list) and speaker and isinstance(speaker[0], str) and speaker[0]:
+                    spk_id = speaker[0]
 
                 req_id = meta.req_id[0] if (meta and meta.req_id) else None
                 stream_finished = (
@@ -1109,6 +1115,7 @@ class CosyVoice3Model(
                             "prompt_token": speech_token[:1],
                             "prompt_feat": speech_feat[:1],
                             "embedding": embedding[:1],
+                            "spk_id": spk_id,
                             "token_offset_tokens": token_offset,
                             "cache_state": cache_state,
                         }
@@ -1125,6 +1132,7 @@ class CosyVoice3Model(
                             "prompt_token": speech_token[:1],
                             "prompt_feat": speech_feat[:1],
                             "embedding": embedding[:1],
+                            "spk_id": spk_id,
                             "token_offset_tokens": token_offset,
                             "cache_state": None,
                         }
@@ -1153,6 +1161,7 @@ class CosyVoice3Model(
                         n_timesteps=10,
                         token_offset_tokens=int(job["token_offset_tokens"]),
                         finalize=stream_finished,
+                        spk_id=job["spk_id"] if isinstance(job.get("spk_id"), str) else None,
                     )
                     _store_stream_cache(job, new_cache_state)
                 else:
@@ -1163,6 +1172,7 @@ class CosyVoice3Model(
                         embedding=job["embedding"],
                         n_timesteps=10,
                         token_offset_tokens=int(job["token_offset_tokens"]),
+                        spk_id=job["spk_id"] if isinstance(job.get("spk_id"), str) else None,
                     )
                 audio = tts_speech.reshape(-1).to(dtype=torch.float32)
                 audios[idx] = self._stitch_stream_audio(job["req_id"], audio, stream_finished)
@@ -1179,6 +1189,7 @@ class CosyVoice3Model(
                             "prompt_token": job["prompt_token"],
                             "prompt_feat": job["prompt_feat"],
                             "embedding": job["embedding"],
+                            "spk_id": job["spk_id"] if isinstance(job.get("spk_id"), str) else None,
                             "token_offset_tokens": int(job["token_offset_tokens"]),
                             "streaming": bool(job["uses_streaming_decode"]),
                             "finalize": bool(job["stream_finished"]) if bool(job["uses_streaming_decode"]) else True,
