@@ -684,6 +684,200 @@ def test_cfm_cuda_graph_env_accepts_enabled(monkeypatch):
     assert _cosyvoice3_cfm_cuda_graph_enabled() is True
 
 
+def test_prompt_prefix_cache_env_defaults_disabled(monkeypatch):
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import (
+        _cosyvoice3_prompt_prefix_cache_enabled,
+        _cosyvoice3_prompt_prefix_cache_max_size,
+    )
+
+    monkeypatch.delenv("COSYVOICE3_PROMPT_PREFIX_CACHE", raising=False)
+    monkeypatch.delenv("COSYVOICE3_PROMPT_PREFIX_CACHE_MAX_SIZE", raising=False)
+
+    assert _cosyvoice3_prompt_prefix_cache_enabled() is False
+    assert _cosyvoice3_prompt_prefix_cache_max_size() == 16
+
+
+def test_prompt_prefix_cache_hit_matches_eager_and_tracks_stats(monkeypatch):
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import CausalMaskedDiffWithDiT
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreLookaheadLayer
+
+    class DummyDecoder(nn.Module):
+        def forward(self, mu, mask, spks=None, cond=None, n_timesteps=10, streaming=True):
+            spk_term = spks.mean(dim=1, keepdim=True).unsqueeze(-1)
+            return (mu + cond + spk_term) * mask.to(mu.dtype), None
+
+    def build_model():
+        torch.manual_seed(1234)
+        model = CausalMaskedDiffWithDiT(
+            input_size=4,
+            output_size=4,
+            spk_embed_dim=3,
+            vocab_size=32,
+            token_mel_ratio=1,
+            pre_lookahead_len=2,
+            pre_lookahead_layer=PreLookaheadLayer(in_channels=4, channels=5, pre_lookahead_len=2),
+            decoder=DummyDecoder(),
+        )
+        model.eval()
+        return model
+
+    token = torch.tensor([[1, 2, 3]], dtype=torch.int32)
+    token_len = torch.tensor([3], dtype=torch.int32)
+    prompt_token = torch.tensor([[4, 5, 6, 7, 8]], dtype=torch.int32)
+    prompt_token_len = torch.tensor([5], dtype=torch.int32)
+    prompt_feat = torch.randn(1, 5, 4)
+    prompt_feat_len = torch.tensor([5], dtype=torch.int32)
+    embedding = torch.randn(1, 3)
+
+    monkeypatch.delenv("COSYVOICE3_PROMPT_PREFIX_CACHE", raising=False)
+    eager = build_model()
+    eager_out, _ = eager.inference(
+        token=token,
+        token_len=token_len,
+        prompt_token=prompt_token,
+        prompt_token_len=prompt_token_len,
+        prompt_feat=prompt_feat,
+        prompt_feat_len=prompt_feat_len,
+        embedding=embedding,
+        streaming=True,
+        finalize=False,
+        n_timesteps=1,
+    )
+
+    monkeypatch.setenv("COSYVOICE3_PROMPT_PREFIX_CACHE", "1")
+    cached = build_model()
+    miss_out, _ = cached.inference(
+        token=token,
+        token_len=token_len,
+        prompt_token=prompt_token,
+        prompt_token_len=prompt_token_len,
+        prompt_feat=prompt_feat,
+        prompt_feat_len=prompt_feat_len,
+        embedding=embedding,
+        streaming=True,
+        finalize=False,
+        n_timesteps=1,
+        prompt_prefix_cache_keys=["spk-a"],
+    )
+    hit_out, _ = cached.inference(
+        token=token,
+        token_len=token_len,
+        prompt_token=prompt_token,
+        prompt_token_len=prompt_token_len,
+        prompt_feat=prompt_feat,
+        prompt_feat_len=prompt_feat_len,
+        embedding=embedding,
+        streaming=True,
+        finalize=False,
+        n_timesteps=1,
+        prompt_prefix_cache_keys=["spk-a"],
+    )
+
+    assert torch.allclose(miss_out, eager_out)
+    assert torch.allclose(hit_out, eager_out)
+    stats = cached.get_prompt_prefix_cache_stats()
+    assert stats["misses"] == 1
+    assert stats["hits"] == 1
+    assert stats["cache_size"] == 1
+    assert stats["hit_rate"] == 0.5
+    assert stats["saved_preprocess_ms"] >= 0.0
+
+
+def test_prompt_prefix_cache_missing_spk_id_bypasses(monkeypatch):
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import CausalMaskedDiffWithDiT
+
+    class IdentityPreLookahead(nn.Module):
+        def forward(self, x, context=None):
+            return x
+
+    class DummyDecoder(nn.Module):
+        def forward(self, mu, mask, spks=None, cond=None, n_timesteps=10, streaming=True):
+            return mu * mask.to(mu.dtype), None
+
+    monkeypatch.setenv("COSYVOICE3_PROMPT_PREFIX_CACHE", "1")
+    model = CausalMaskedDiffWithDiT(
+        input_size=4,
+        output_size=4,
+        spk_embed_dim=3,
+        vocab_size=32,
+        token_mel_ratio=1,
+        pre_lookahead_len=1,
+        pre_lookahead_layer=IdentityPreLookahead(),
+        decoder=DummyDecoder(),
+    )
+    model.eval()
+
+    model.inference(
+        token=torch.tensor([[1, 2]], dtype=torch.int32),
+        token_len=torch.tensor([2], dtype=torch.int32),
+        prompt_token=torch.tensor([[3, 4]], dtype=torch.int32),
+        prompt_token_len=torch.tensor([2], dtype=torch.int32),
+        prompt_feat=torch.randn(1, 2, 4),
+        prompt_feat_len=torch.tensor([2], dtype=torch.int32),
+        embedding=torch.randn(1, 3),
+        streaming=True,
+        finalize=False,
+        n_timesteps=1,
+        prompt_prefix_cache_keys=[None],
+    )
+
+    stats = model.get_prompt_prefix_cache_stats()
+    assert stats["bypasses"] == 1
+    assert stats["misses"] == 0
+    assert stats["hits"] == 0
+    assert stats["cache_size"] == 0
+
+
+def test_prompt_prefix_cache_lru_eviction(monkeypatch):
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import CausalMaskedDiffWithDiT
+
+    class IdentityPreLookahead(nn.Module):
+        def forward(self, x, context=None):
+            return x
+
+    class DummyDecoder(nn.Module):
+        def forward(self, mu, mask, spks=None, cond=None, n_timesteps=10, streaming=True):
+            return mu * mask.to(mu.dtype), None
+
+    monkeypatch.setenv("COSYVOICE3_PROMPT_PREFIX_CACHE", "1")
+    monkeypatch.setenv("COSYVOICE3_PROMPT_PREFIX_CACHE_MAX_SIZE", "1")
+    model = CausalMaskedDiffWithDiT(
+        input_size=4,
+        output_size=4,
+        spk_embed_dim=3,
+        vocab_size=32,
+        token_mel_ratio=1,
+        pre_lookahead_len=1,
+        pre_lookahead_layer=IdentityPreLookahead(),
+        decoder=DummyDecoder(),
+    )
+    model.eval()
+
+    def run(spk_id: str):
+        model.inference(
+            token=torch.tensor([[1, 2]], dtype=torch.int32),
+            token_len=torch.tensor([2], dtype=torch.int32),
+            prompt_token=torch.tensor([[3, 4]], dtype=torch.int32),
+            prompt_token_len=torch.tensor([2], dtype=torch.int32),
+            prompt_feat=torch.randn(1, 2, 4),
+            prompt_feat_len=torch.tensor([2], dtype=torch.int32),
+            embedding=torch.randn(1, 3),
+            streaming=True,
+            finalize=False,
+            n_timesteps=1,
+            prompt_prefix_cache_keys=[spk_id],
+        )
+
+    run("spk-a")
+    run("spk-b")
+    run("spk-a")
+
+    stats = model.get_prompt_prefix_cache_stats()
+    assert stats["misses"] == 3
+    assert stats["evictions"] == 2
+    assert stats["cache_size"] == 1
+
+
 def test_conditional_cfm_cuda_graph_cpu_fallback_updates_stats(monkeypatch):
     from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import (
         ConditionalCFM,

@@ -4,6 +4,7 @@
 """Conditional Flow Matching (CFM) classes for audio generation."""
 
 import os
+import time
 from abc import ABC
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -42,6 +43,23 @@ def _cosyvoice3_cfm_cuda_graph_max_graphs() -> int:
         return 4
 
 
+def _cosyvoice3_prompt_prefix_cache_enabled() -> bool:
+    value = os.environ.get("COSYVOICE3_PROMPT_PREFIX_CACHE", "0").strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
+def _cosyvoice3_prompt_prefix_cache_max_size() -> int:
+    value = os.environ.get("COSYVOICE3_PROMPT_PREFIX_CACHE_MAX_SIZE", "16")
+    try:
+        return max(1, int(value))
+    except ValueError:
+        logger.warning(
+            "CosyVoice3 prompt prefix cache: unsupported COSYVOICE3_PROMPT_PREFIX_CACHE_MAX_SIZE=%r; using 16",
+            value,
+        )
+        return 16
+
+
 @dataclass(frozen=True)
 class FlowAttentionBatchMetadata:
     """Shape/length metadata for a CosyVoice3 flow batch.
@@ -64,6 +82,172 @@ class FlowAttentionBatchMetadata:
 
     def __getitem__(self, key: str):
         return getattr(self, key)
+
+
+@dataclass
+class FlowPromptPrefixCacheEntry:
+    prompt_token_embed: torch.Tensor
+    stable_h_prefix: torch.Tensor
+    prompt_feat: torch.Tensor
+    spk_embedding: torch.Tensor
+    prompt_token_len: int
+    prompt_feat_len: int
+    dtype: torch.dtype
+    device: torch.device
+    input_size: int
+    output_size: int
+    pre_lookahead_len: int
+    build_ms: float
+
+
+class FlowPromptPrefixCache:
+    """LRU cache for immutable CosyVoice3 prompt/reference flow prefixes."""
+
+    def __init__(self, *, enabled: bool, max_size: int) -> None:
+        self.enabled = bool(enabled)
+        self.max_size = int(max_size)
+        self._cache: OrderedDict[str, FlowPromptPrefixCacheEntry] = OrderedDict()
+        self._stats = {
+            "hits": 0,
+            "misses": 0,
+            "bypasses": 0,
+            "evictions": 0,
+            "shape_mismatches": 0,
+            "build_preprocess_ms": 0.0,
+            "saved_preprocess_ms": 0.0,
+        }
+
+    def stats(self) -> dict[str, int | float]:
+        stats = dict(self._stats)
+        stats["cache_size"] = len(self._cache)
+        lookups = int(stats["hits"]) + int(stats["misses"])
+        stats["hit_rate"] = float(stats["hits"] / lookups) if lookups > 0 else 0.0
+        return stats
+
+    def record_bypass(self, count: int = 1) -> None:
+        self._stats["bypasses"] += int(count)
+
+    def get_or_build(
+        self,
+        flow: "CausalMaskedDiffWithDiT",
+        *,
+        spk_id: str | None,
+        prompt_token: torch.Tensor,
+        prompt_token_len: int,
+        prompt_feat: torch.Tensor,
+        prompt_feat_len: int,
+        embedding: torch.Tensor,
+    ) -> FlowPromptPrefixCacheEntry | None:
+        if not self.enabled:
+            self.record_bypass()
+            return None
+        if not spk_id:
+            self.record_bypass()
+            with record_function("cosyvoice3_prompt_prefix_cache_bypass"):
+                pass
+            return None
+
+        entry = self._cache.get(spk_id)
+        if entry is not None:
+            if self._compatible(
+                entry,
+                prompt_token_len=prompt_token_len,
+                prompt_feat_len=prompt_feat_len,
+                dtype=prompt_feat.dtype,
+                device=prompt_feat.device,
+                input_size=flow.input_size,
+                output_size=flow.output_size,
+                pre_lookahead_len=flow.pre_lookahead_len,
+            ):
+                self._cache.move_to_end(spk_id)
+                self._stats["hits"] += 1
+                self._stats["saved_preprocess_ms"] += entry.build_ms
+                with record_function("cosyvoice3_prompt_prefix_cache_hit"):
+                    pass
+                return entry
+            self._stats["shape_mismatches"] += 1
+            self.record_bypass()
+            with record_function("cosyvoice3_prompt_prefix_cache_shape_mismatch"):
+                pass
+            return None
+
+        with record_function("cosyvoice3_prompt_prefix_cache_miss"):
+            started = time.perf_counter()
+            entry = self._build_entry(
+                flow,
+                prompt_token=prompt_token,
+                prompt_token_len=prompt_token_len,
+                prompt_feat=prompt_feat,
+                prompt_feat_len=prompt_feat_len,
+                embedding=embedding,
+            )
+            entry.build_ms = (time.perf_counter() - started) * 1000.0
+        self._stats["misses"] += 1
+        self._stats["build_preprocess_ms"] += entry.build_ms
+        self._cache[spk_id] = entry
+        self._cache.move_to_end(spk_id)
+        while len(self._cache) > self.max_size:
+            self._cache.popitem(last=False)
+            self._stats["evictions"] += 1
+        return entry
+
+    def _compatible(
+        self,
+        entry: FlowPromptPrefixCacheEntry,
+        *,
+        prompt_token_len: int,
+        prompt_feat_len: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        input_size: int,
+        output_size: int,
+        pre_lookahead_len: int,
+    ) -> bool:
+        return (
+            entry.prompt_token_len == prompt_token_len
+            and entry.prompt_feat_len == prompt_feat_len
+            and entry.dtype == dtype
+            and entry.device == device
+            and entry.input_size == input_size
+            and entry.output_size == output_size
+            and entry.pre_lookahead_len == pre_lookahead_len
+        )
+
+    def _build_entry(
+        self,
+        flow: "CausalMaskedDiffWithDiT",
+        *,
+        prompt_token: torch.Tensor,
+        prompt_token_len: int,
+        prompt_feat: torch.Tensor,
+        prompt_feat_len: int,
+        embedding: torch.Tensor,
+    ) -> FlowPromptPrefixCacheEntry:
+        valid_prompt_token = prompt_token[:, :prompt_token_len]
+        prompt_token_embed = flow.input_embedding(torch.clamp(valid_prompt_token, min=0)).detach().contiguous()
+        stable_h_len = max(0, prompt_token_len - int(flow.pre_lookahead_len))
+        if stable_h_len > 0:
+            context = prompt_token_embed[:, stable_h_len:prompt_token_len]
+            stable_h_prefix = flow.pre_lookahead_layer(prompt_token_embed[:, :stable_h_len], context=context)
+            stable_h_prefix = stable_h_prefix[:, :stable_h_len].detach().contiguous()
+        else:
+            stable_h_prefix = prompt_token_embed.new_zeros((1, 0, flow.input_size))
+        prompt_feat_prefix = prompt_feat[:, :prompt_feat_len].detach().contiguous()
+        spk_embedding = flow.spk_embed_affine_layer(F.normalize(embedding, dim=1)).detach().contiguous()
+        return FlowPromptPrefixCacheEntry(
+            prompt_token_embed=prompt_token_embed,
+            stable_h_prefix=stable_h_prefix,
+            prompt_feat=prompt_feat_prefix,
+            spk_embedding=spk_embedding,
+            prompt_token_len=prompt_token_len,
+            prompt_feat_len=prompt_feat_len,
+            dtype=prompt_feat.dtype,
+            device=prompt_feat.device,
+            input_size=flow.input_size,
+            output_size=flow.output_size,
+            pre_lookahead_len=int(flow.pre_lookahead_len),
+            build_ms=0.0,
+        )
 
 
 @dataclass
@@ -639,6 +823,13 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         self.decoder = decoder
         self.only_mask_loss = only_mask_loss
         self.token_mel_ratio = token_mel_ratio
+        self._prompt_prefix_cache = FlowPromptPrefixCache(
+            enabled=_cosyvoice3_prompt_prefix_cache_enabled(),
+            max_size=_cosyvoice3_prompt_prefix_cache_max_size(),
+        )
+
+    def get_prompt_prefix_cache_stats(self) -> dict[str, int | float]:
+        return self._prompt_prefix_cache.stats()
 
     @torch.inference_mode()
     def inference(
@@ -653,7 +844,40 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         streaming: bool = True,
         finalize: bool = False,
         n_timesteps: int = 10,
+        prompt_prefix_cache_keys: list[str | None] | None = None,
     ):
+        if prompt_prefix_cache_keys is not None and self._prompt_prefix_cache.enabled:
+            if not any(prompt_prefix_cache_keys):
+                self._prompt_prefix_cache.record_bypass(token.shape[0])
+                with record_function("cosyvoice3_prompt_prefix_cache_bypass"):
+                    pass
+                return self.inference(
+                    token=token,
+                    token_len=token_len,
+                    prompt_token=prompt_token,
+                    prompt_token_len=prompt_token_len,
+                    prompt_feat=prompt_feat,
+                    prompt_feat_len=prompt_feat_len,
+                    embedding=embedding,
+                    streaming=streaming,
+                    finalize=finalize,
+                    n_timesteps=n_timesteps,
+                    prompt_prefix_cache_keys=None,
+                )
+            return self._inference_with_prompt_prefix_cache(
+                token=token,
+                token_len=token_len,
+                prompt_token=prompt_token,
+                prompt_token_len=prompt_token_len,
+                prompt_feat=prompt_feat,
+                prompt_feat_len=prompt_feat_len,
+                embedding=embedding,
+                streaming=streaming,
+                finalize=finalize,
+                n_timesteps=n_timesteps,
+                prompt_prefix_cache_keys=prompt_prefix_cache_keys,
+            )
+
         batch = token.shape[0]
         # xvec projection
 
@@ -730,6 +954,149 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
                 generated[row, :, :length] = feat[row, :, start : start + length]
         metadata = FlowAttentionBatchMetadata(
             token_lens=token_len - prompt_token_len,
+            prompt_token_lens=prompt_token_len,
+            prompt_feat_lens=prompt_feat_len,
+            total_token_lens=total_token_len,
+            total_mel_lens=total_mel_lens,
+            generated_mel_lens=generated_mel_lens,
+            max_seqlen=int(h.shape[1]),
+        )
+        return generated, metadata
+
+    def _inference_with_prompt_prefix_cache(
+        self,
+        *,
+        token,
+        token_len,
+        prompt_token,
+        prompt_token_len,
+        prompt_feat,
+        prompt_feat_len,
+        embedding,
+        streaming: bool,
+        finalize: bool,
+        n_timesteps: int,
+        prompt_prefix_cache_keys: list[str | None],
+    ):
+        batch = token.shape[0]
+        if len(prompt_prefix_cache_keys) != batch:
+            self._prompt_prefix_cache.record_bypass(batch)
+            return self.inference(
+                token=token,
+                token_len=token_len,
+                prompt_token=prompt_token,
+                prompt_token_len=prompt_token_len,
+                prompt_feat=prompt_feat,
+                prompt_feat_len=prompt_feat_len,
+                embedding=embedding,
+                streaming=streaming,
+                finalize=finalize,
+                n_timesteps=n_timesteps,
+                prompt_prefix_cache_keys=None,
+            )
+
+        speech_token_len = token_len
+        total_token_len = prompt_token_len + speech_token_len
+        h_lens = total_token_len if finalize is True else torch.clamp(total_token_len - self.pre_lookahead_len, min=0)
+        max_h_len = int(h_lens.max().item()) if batch > 0 else 0
+        h = prompt_feat.new_zeros((batch, max_h_len, self.input_size))
+        spk_rows: list[torch.Tensor] = []
+        entries: list[FlowPromptPrefixCacheEntry | None] = []
+
+        for row in range(batch):
+            p_tok_len = int(prompt_token_len[row].item())
+            p_feat_len = int(prompt_feat_len[row].item())
+            key = prompt_prefix_cache_keys[row]
+            entry = self._prompt_prefix_cache.get_or_build(
+                self,
+                spk_id=key,
+                prompt_token=prompt_token[row : row + 1],
+                prompt_token_len=p_tok_len,
+                prompt_feat=prompt_feat[row : row + 1],
+                prompt_feat_len=p_feat_len,
+                embedding=embedding[row : row + 1],
+            )
+            entries.append(entry)
+            if entry is None:
+                spk_rows.append(self.spk_embed_affine_layer(F.normalize(embedding[row : row + 1], dim=1)))
+            else:
+                spk_rows.append(entry.spk_embedding)
+
+        projected_embedding = torch.cat(spk_rows, dim=0) if spk_rows else embedding.new_zeros((0, self.output_size))
+
+        for row in range(batch):
+            p_tok_len = int(prompt_token_len[row].item())
+            speech_len = int(speech_token_len[row].item())
+            valid_tokens = int(total_token_len[row].item())
+            out_tokens = int(h_lens[row].item())
+            if out_tokens == 0:
+                continue
+
+            entry = entries[row]
+            if entry is None:
+                prompt_embed = self.input_embedding(torch.clamp(prompt_token[row : row + 1, :p_tok_len], min=0))
+                stable_h = None
+            else:
+                prompt_embed = entry.prompt_token_embed
+                stable_h = entry.stable_h_prefix
+            speech_embed = self.input_embedding(torch.clamp(token[row : row + 1, :speech_len], min=0))
+            row_token = torch.cat([prompt_embed, speech_embed], dim=1)
+
+            stable_to_use = 0
+            if stable_h is not None and stable_h.size(1) > 0:
+                stable_to_use = min(int(stable_h.size(1)), out_tokens)
+                h[row : row + 1, :stable_to_use] = stable_h[:, :stable_to_use]
+            if out_tokens <= stable_to_use:
+                continue
+
+            # Conv2 in PreLookaheadLayer uses two left conv1 outputs, so include
+            # a two-token overlap before the uncached suffix and discard it.
+            suffix_start = max(0, stable_to_use - 2)
+            suffix_inputs = row_token[:, suffix_start:valid_tokens]
+            local_out_tokens = out_tokens - suffix_start
+            if finalize is True:
+                suffix_h = self.pre_lookahead_layer(suffix_inputs)
+            else:
+                suffix_h = self.pre_lookahead_layer(
+                    suffix_inputs[:, :local_out_tokens],
+                    context=suffix_inputs[:, local_out_tokens:],
+                )
+            copy_start = stable_to_use - suffix_start
+            h[row : row + 1, stable_to_use:out_tokens] = suffix_h[:, copy_start:local_out_tokens]
+
+        h = h.repeat_interleave(self.token_mel_ratio, dim=1)
+        total_mel_lens = h_lens * int(self.token_mel_ratio)
+        generated_mel_lens = torch.clamp(total_mel_lens - prompt_feat_len, min=0)
+        max_generated_mel_len = int(generated_mel_lens.max().item()) if batch > 0 else 0
+
+        conds = torch.zeros([batch, h.shape[1], self.output_size], device=token.device).to(h.dtype)
+        for row in range(batch):
+            p_feat_len = int(prompt_feat_len[row].item())
+            if p_feat_len <= 0:
+                continue
+            entry = entries[row]
+            prompt_feat_row = prompt_feat[row : row + 1, :p_feat_len] if entry is None else entry.prompt_feat
+            conds[row : row + 1, :p_feat_len] = prompt_feat_row
+
+        conds = conds.transpose(1, 2)
+        mask = (~make_pad_mask(total_mel_lens, max_len=h.shape[1])).to(h)
+        feat, _ = self.decoder(
+            mu=h.transpose(1, 2).contiguous(),
+            mask=mask.unsqueeze(1),
+            spks=projected_embedding,
+            cond=conds,
+            n_timesteps=max(1, int(n_timesteps)),
+            streaming=streaming,
+        )
+
+        generated = feat.new_zeros((batch, self.output_size, max_generated_mel_len))
+        for row in range(batch):
+            start = int(prompt_feat_len[row].item())
+            length = int(generated_mel_lens[row].item())
+            if length > 0:
+                generated[row, :, :length] = feat[row, :, start : start + length]
+        metadata = FlowAttentionBatchMetadata(
+            token_lens=total_token_len - prompt_token_len,
             prompt_token_lens=prompt_token_len,
             prompt_feat_lens=prompt_feat_len,
             total_token_lens=total_token_len,

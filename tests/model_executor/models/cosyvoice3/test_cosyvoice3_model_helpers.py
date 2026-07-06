@@ -303,6 +303,31 @@ def test_forward_uses_non_stream_decode_without_chunk_metadata():
     assert call["token_offset_tokens"] == 0
 
 
+def test_forward_passes_speaker_id_to_single_code2wav_call():
+    model = _make_code2wav_model()
+
+    runtime_info = [
+        {
+            "embed": {
+                "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
+                "speech_feat": torch.ones((1, 6, 80), dtype=torch.float32),
+                "embedding": torch.ones((1, 4), dtype=torch.float32),
+            },
+            "meta": {"left_context_size": 0},
+            "speaker": ["speaker-a"],
+        }
+    ]
+
+    model.forward(
+        input_ids=torch.tensor([0, 1, 2], dtype=torch.long),
+        positions=torch.arange(3, dtype=torch.long),
+        model_intermediate_buffer=runtime_info,
+        seq_token_counts=[3],
+    )
+
+    assert model.code2wav.forward_streaming_calls[0]["spk_id"] == "speaker-a"
+
+
 def test_forward_uses_non_stream_talker_prefill_offset():
     model = _make_code2wav_model()
 
@@ -372,6 +397,7 @@ def test_forward_flow_batch_enabled_groups_heterogeneous_requests(monkeypatch):
                 "embedding": torch.ones((1, 4), dtype=torch.float32),
             },
             "meta": {"left_context_size": 0, "stream_finished": torch.tensor(False)},
+            "speaker": ["speaker-a"],
         },
         {
             "embed": {
@@ -380,6 +406,7 @@ def test_forward_flow_batch_enabled_groups_heterogeneous_requests(monkeypatch):
                 "embedding": torch.ones((1, 4), dtype=torch.float32),
             },
             "meta": {"left_context_size": 1, "stream_finished": torch.tensor(False)},
+            "speaker": ["speaker-b"],
         },
     ]
 
@@ -395,6 +422,7 @@ def test_forward_flow_batch_enabled_groups_heterogeneous_requests(monkeypatch):
     batch_call = model.code2wav.forward_mel_batch_calls[0]
     assert len(batch_call["requests"]) == 2
     assert [req["token"].shape[-1] for req in batch_call["requests"]] == [2, 3]
+    assert [req["spk_id"] for req in batch_call["requests"]] == ["speaker-a", "speaker-b"]
     assert [audio.tolist() for audio in out.multimodal_outputs["audio"]] == [
         [1.0, 1.0],
         [2.0, 2.0],
