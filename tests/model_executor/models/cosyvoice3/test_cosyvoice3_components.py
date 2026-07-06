@@ -104,6 +104,29 @@ class TestDiTAttention:
         assert attention.to_k.out_features == 512
         assert attention.to_v.out_features == 512
 
+    @pytest.mark.core_model
+    @pytest.mark.cpu
+    def test_forward_passes_padding_mask_to_attention_backend(self):
+        from vllm_omni.diffusion.models.cosyvoice3_audio.cosyvoice3_dit import DiTAttention
+
+        captured = {}
+
+        class RecordingAttention(nn.Module):
+            def forward(self, query, key, value, attn_metadata=None):
+                captured["attn_metadata"] = attn_metadata
+                return torch.zeros_like(query)
+
+        attn = DiTAttention(dim=8, heads=2, dim_head=4, dropout=0.0)
+        attn.attn = RecordingAttention()
+        x = torch.randn(2, 4, 8)
+        key_mask = torch.tensor([[True, True, False, False], [True, True, True, False]])
+        mask = key_mask.unsqueeze(1).repeat(1, 4, 1).unsqueeze(1)
+
+        out = attn(x, mask=mask)
+
+        assert out.shape == x.shape
+        assert captured["attn_metadata"].attn_mask.tolist() == key_mask.tolist()
+
 
 class TestDiTBlock:
     """Tests for DiTBlock."""
@@ -284,6 +307,51 @@ class TestCFM:
         assert out.shape == mu.shape
         assert out.dtype == torch.float16
 
+    @pytest.mark.core_model
+    @pytest.mark.cpu
+    def test_causal_conditional_cfm_batches_cfg_estimator_inputs(self):
+        """Batched CFM should run the estimator with CFG batch 2B."""
+        from omegaconf import DictConfig
+
+        from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import CausalConditionalCFM
+
+        class RecordingEstimator(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.calls: list[tuple[int, ...]] = []
+
+            def forward(self, x, mask, mu, t, spks=None, cond=None):
+                self.calls.append(tuple(x.shape))
+                return torch.zeros_like(x)
+
+        estimator = RecordingEstimator()
+        cfm = CausalConditionalCFM(
+            in_channels=80,
+            cfm_params=DictConfig(
+                {
+                    "sigma_min": 1e-6,
+                    "solver": "euler",
+                    "t_scheduler": "linear",
+                    "training_cfg_rate": 0.2,
+                    "inference_cfg_rate": 0.7,
+                }
+            ),
+            n_spks=1,
+            spk_emb_dim=80,
+            estimator=estimator,
+        )
+
+        mu = torch.randn(3, 80, 8)
+        mask = torch.ones(3, 1, 8)
+        spks = torch.randn(3, 80)
+        cond = torch.randn(3, 80, 8)
+
+        out, _ = cfm(mu, mask, n_timesteps=2, spks=spks, cond=cond)
+
+        assert out.shape == mu.shape
+        assert estimator.calls
+        assert estimator.calls[0] == (6, 80, 8)
+
 
 class TestSDPAFallback:
     """Test SDPA fallback for float32 inputs."""
@@ -410,3 +478,117 @@ def test_code2wav_load_weights_applies_fp16_flow_dtype(monkeypatch, tmp_path):
 
     assert next(model.flow_model.parameters()).dtype == torch.float16
     assert next(model.hift.parameters()).dtype == torch.float32
+
+
+def test_causal_masked_diff_with_dit_returns_batched_generated_lengths():
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import CausalMaskedDiffWithDiT
+
+    class DummyPreLookahead(nn.Module):
+        def forward(self, x, context=None):
+            return x if context is None else x
+
+    class DummyDecoder(nn.Module):
+        def forward(self, mu, mask, spks=None, cond=None, n_timesteps=10, streaming=True):
+            return mu * mask.to(mu.dtype), None
+
+    model = CausalMaskedDiffWithDiT(
+        input_size=80,
+        output_size=80,
+        spk_embed_dim=4,
+        vocab_size=16,
+        token_mel_ratio=1,
+        pre_lookahead_len=1,
+        pre_lookahead_layer=DummyPreLookahead(),
+        decoder=DummyDecoder(),
+    )
+
+    token = torch.tensor([[1, 2, 0], [3, 4, 5]], dtype=torch.int32)
+    token_len = torch.tensor([2, 3], dtype=torch.int32)
+    prompt_token = torch.tensor([[6, 0], [7, 8]], dtype=torch.int32)
+    prompt_token_len = torch.tensor([1, 2], dtype=torch.int32)
+    prompt_feat = torch.randn(2, 2, 80)
+    prompt_feat_len = torch.tensor([1, 2], dtype=torch.int32)
+    embedding = torch.randn(2, 4)
+
+    feat, meta = model.inference(
+        token=token,
+        token_len=token_len,
+        prompt_token=prompt_token,
+        prompt_token_len=prompt_token_len,
+        prompt_feat=prompt_feat,
+        prompt_feat_len=prompt_feat_len,
+        embedding=embedding,
+        streaming=False,
+        finalize=True,
+        n_timesteps=1,
+    )
+
+    assert feat.shape == (2, 80, 3)
+    assert meta["generated_mel_lens"].tolist() == [2, 3]
+
+
+def test_code2wav_forward_mel_batch_pads_and_splits_variable_lengths():
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
+
+    class DummyFlow(nn.Module):
+        token_mel_ratio = 1
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(1))
+            self.calls: list[dict[str, torch.Tensor]] = []
+
+        def inference(self, **kwargs):
+            self.calls.append(kwargs)
+            lengths = kwargs["token_len"]
+            max_len = int(lengths.max().item())
+            feat = torch.zeros((len(lengths), 80, max_len), dtype=self.weight.dtype)
+            for row, length in enumerate(lengths.tolist()):
+                feat[row, :, :length] = float(row + 1)
+            return feat, {"generated_mel_lens": lengths}
+
+    model = object.__new__(CosyVoice3Code2Wav)
+    nn.Module.__init__(model)
+    model.flow_model = DummyFlow()
+    model._flow_batch_metadata_cache = {}
+    model._flow_batch_stats = {
+        "groups": 0,
+        "requests": 0,
+        "metadata_hits": 0,
+        "metadata_misses": 0,
+        "fallbacks": 0,
+    }
+
+    outputs = model._forward_mel_batch(
+        [
+            {
+                "token": torch.tensor([[1, 2]], dtype=torch.int32),
+                "prompt_token": torch.tensor([[3]], dtype=torch.int32),
+                "prompt_feat": torch.randn(1, 1, 80),
+                "embedding": torch.randn(1, 4),
+                "token_offset_tokens": 0,
+                "streaming": True,
+                "finalize": False,
+            },
+            {
+                "token": torch.tensor([[4, 5, 6]], dtype=torch.int32),
+                "prompt_token": torch.tensor([[7, 8]], dtype=torch.int32),
+                "prompt_feat": torch.randn(1, 2, 80),
+                "embedding": torch.randn(1, 4),
+                "token_offset_tokens": 1,
+                "streaming": True,
+                "finalize": False,
+            },
+        ],
+        n_timesteps=1,
+    )
+
+    assert [tuple(out.shape) for out in outputs] == [(1, 80, 2), (1, 80, 2)]
+    assert torch.all(outputs[0] == 1)
+    assert torch.all(outputs[1] == 2)
+    call = model.flow_model.calls[0]
+    assert call["token"].shape == (2, 3)
+    assert call["prompt_token"].shape == (2, 2)
+    assert call["prompt_feat"].shape == (2, 2, 80)
+    assert model._flow_batch_stats["groups"] == 1
+    assert model._flow_batch_stats["requests"] == 2

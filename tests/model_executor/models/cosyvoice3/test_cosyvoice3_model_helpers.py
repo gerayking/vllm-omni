@@ -36,12 +36,24 @@ class _DummyCode2Wav:
         vocab_size: int,
         num_samples: int = 32,
         outputs: list[tuple[torch.Tensor, dict[str, object] | None]] | None = None,
+        batch_error: Exception | None = None,
     ):
         self.input_embedding = SimpleNamespace(num_embeddings=vocab_size)
         self.num_samples = num_samples
         self.outputs = list(outputs or [])
+        self.batch_error = batch_error
         self.forward_calls: list[dict[str, object]] = []
         self.forward_streaming_calls: list[dict[str, object]] = []
+        self.forward_mel_batch_calls: list[dict[str, object]] = []
+        self.audio_from_mel_calls: list[torch.Tensor] = []
+        self.streaming_audio_from_mel_calls: list[dict[str, object]] = []
+        self._flow_batch_stats = {
+            "groups": 0,
+            "requests": 0,
+            "metadata_hits": 0,
+            "metadata_misses": 0,
+            "fallbacks": 0,
+        }
 
     def forward(self, **kwargs):
         self.forward_calls.append(kwargs)
@@ -65,12 +77,46 @@ class _DummyCode2Wav:
             }
         return audio, new_state
 
+    def _forward_mel_batch(self, requests, n_timesteps=10):
+        if self.batch_error is not None:
+            raise self.batch_error
+        self.forward_mel_batch_calls.append({"requests": requests, "n_timesteps": n_timesteps})
+        feats = []
+        for idx, req in enumerate(requests):
+            length = int(req["token"].shape[-1])
+            offset = int(req.get("token_offset_tokens", 0))
+            mel_len = max(1, length - offset)
+            feats.append(torch.full((1, 80, mel_len), float(idx + 1), dtype=torch.float32))
+        self._flow_batch_stats["groups"] += 1
+        self._flow_batch_stats["requests"] += len(requests)
+        return feats
+
+    def _audio_from_mel(self, feat):
+        self.audio_from_mel_calls.append(feat)
+        value = float(feat.reshape(-1)[0].item()) if feat.numel() else 0.0
+        return torch.full((1, 1, max(int(feat.shape[-1]), 1)), value, dtype=torch.float32)
+
+    def _streaming_audio_from_mel(self, feat, *, cache_state=None, finalize=False):
+        self.streaming_audio_from_mel_calls.append(
+            {"feat": feat, "cache_state": cache_state, "finalize": finalize}
+        )
+        value = float(feat.reshape(-1)[0].item()) if feat.numel() else 0.0
+        audio = torch.full((1, 1, max(int(feat.shape[-1]), 1)), value, dtype=torch.float32)
+        new_state = None
+        if not finalize:
+            new_state = {
+                "mel": feat.detach().cpu().contiguous(),
+                "speech_offset": audio.shape[-1],
+            }
+        return audio, new_state
+
 
 def _make_code2wav_model(
     *,
     with_stride_cfg: bool = False,
     num_samples: int = 32,
     outputs: list[tuple[torch.Tensor, dict[str, object] | None]] | None = None,
+    batch_error: Exception | None = None,
 ) -> CosyVoice3Model:
     CosyVoice3Model, _ = _cosyvoice3_model_and_runner()
     model = object.__new__(CosyVoice3Model)
@@ -83,7 +129,12 @@ def _make_code2wav_model(
         token_frame_rate=25 if with_stride_cfg else 0,
         token_mel_ratio=2 if with_stride_cfg else 0,
     )
-    model.code2wav = _DummyCode2Wav(vocab_size=4, num_samples=num_samples, outputs=outputs)
+    model.code2wav = _DummyCode2Wav(
+        vocab_size=4,
+        num_samples=num_samples,
+        outputs=outputs,
+        batch_error=batch_error,
+    )
     # Short-circuit the lazy TensorRT estimator swap: these tests exercise the
     # forward audio logic, not the TRT path. On a GPU CI runner the swap would
     # otherwise run and dereference ``self.model_dir`` (only set in __init__,
@@ -274,6 +325,114 @@ def test_forward_uses_non_stream_talker_prefill_offset():
     )
 
     assert model.code2wav.forward_calls[0]["token_offset_tokens"] == 3
+
+
+def test_forward_flow_batch_disabled_preserves_single_request_path(monkeypatch):
+    monkeypatch.delenv("COSYVOICE3_FLOW_BATCH", raising=False)
+    model = _make_code2wav_model(with_stride_cfg=True)
+    runtime_info = [
+        {
+            "embed": {
+                "speech_token": torch.tensor([[1, 2]], dtype=torch.long),
+                "speech_feat": torch.ones((1, 4, 80), dtype=torch.float32),
+                "embedding": torch.ones((1, 4), dtype=torch.float32),
+            },
+            "meta": {"left_context_size": 0},
+        },
+        {
+            "embed": {
+                "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
+                "speech_feat": torch.ones((1, 6, 80), dtype=torch.float32),
+                "embedding": torch.ones((1, 4), dtype=torch.float32),
+            },
+            "meta": {"left_context_size": 0},
+        },
+    ]
+
+    model.forward(
+        input_ids=torch.tensor([0, 1, 0, 1, 2], dtype=torch.long),
+        positions=torch.arange(5, dtype=torch.long),
+        model_intermediate_buffer=runtime_info,
+        seq_token_counts=[2, 3],
+    )
+
+    assert len(model.code2wav.forward_mel_batch_calls) == 0
+    assert len(model.code2wav.forward_streaming_calls) == 2
+
+
+def test_forward_flow_batch_enabled_groups_heterogeneous_requests(monkeypatch):
+    monkeypatch.setenv("COSYVOICE3_FLOW_BATCH", "1")
+    monkeypatch.setenv("COSYVOICE3_FLOW_BATCH_MAX_SIZE", "4")
+    model = _make_code2wav_model(with_stride_cfg=True)
+    runtime_info = [
+        {
+            "embed": {
+                "speech_token": torch.tensor([[1, 2]], dtype=torch.long),
+                "speech_feat": torch.ones((1, 4, 80), dtype=torch.float32),
+                "embedding": torch.ones((1, 4), dtype=torch.float32),
+            },
+            "meta": {"left_context_size": 0, "stream_finished": torch.tensor(False)},
+        },
+        {
+            "embed": {
+                "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
+                "speech_feat": torch.ones((1, 6, 80), dtype=torch.float32),
+                "embedding": torch.ones((1, 4), dtype=torch.float32),
+            },
+            "meta": {"left_context_size": 1, "stream_finished": torch.tensor(False)},
+        },
+    ]
+
+    out = model.forward(
+        input_ids=torch.tensor([0, 1, 0, 1, 2], dtype=torch.long),
+        positions=torch.arange(5, dtype=torch.long),
+        model_intermediate_buffer=runtime_info,
+        seq_token_counts=[2, 3],
+    )
+
+    assert len(model.code2wav.forward_streaming_calls) == 0
+    assert len(model.code2wav.forward_mel_batch_calls) == 1
+    batch_call = model.code2wav.forward_mel_batch_calls[0]
+    assert len(batch_call["requests"]) == 2
+    assert [req["token"].shape[-1] for req in batch_call["requests"]] == [2, 3]
+    assert [audio.tolist() for audio in out.multimodal_outputs["audio"]] == [
+        [1.0, 1.0],
+        [2.0, 2.0],
+    ]
+
+
+def test_forward_flow_batch_falls_back_to_single_request_on_batch_error(monkeypatch):
+    monkeypatch.setenv("COSYVOICE3_FLOW_BATCH", "1")
+    model = _make_code2wav_model(with_stride_cfg=True, batch_error=RuntimeError("batch boom"))
+    runtime_info = [
+        {
+            "embed": {
+                "speech_token": torch.tensor([[1, 2]], dtype=torch.long),
+                "speech_feat": torch.ones((1, 4, 80), dtype=torch.float32),
+                "embedding": torch.ones((1, 4), dtype=torch.float32),
+            },
+            "meta": {"left_context_size": 0},
+        },
+        {
+            "embed": {
+                "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
+                "speech_feat": torch.ones((1, 6, 80), dtype=torch.float32),
+                "embedding": torch.ones((1, 4), dtype=torch.float32),
+            },
+            "meta": {"left_context_size": 0},
+        },
+    ]
+
+    model.forward(
+        input_ids=torch.tensor([0, 1, 0, 1, 2], dtype=torch.long),
+        positions=torch.arange(5, dtype=torch.long),
+        model_intermediate_buffer=runtime_info,
+        seq_token_counts=[2, 3],
+    )
+
+    assert len(model.code2wav.forward_mel_batch_calls) == 0
+    assert len(model.code2wav.forward_streaming_calls) == 2
+    assert model.code2wav._flow_batch_stats["fallbacks"] == 2
 
 
 def test_forward_reuses_streaming_cache_state_between_chunks():
@@ -534,6 +693,22 @@ def test_cosyvoice3_flow_dtype_env_accepts_fp16(monkeypatch):
     monkeypatch.setenv("COSYVOICE3_FLOW_DTYPE", "fp16")
 
     assert _cosyvoice3_flow_dtype() == torch.float16
+
+
+def test_cosyvoice3_flow_batch_env_defaults_disabled(monkeypatch):
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import (
+        _cosyvoice3_flow_batch_enabled,
+        _cosyvoice3_flow_batch_max_size,
+        _cosyvoice3_flow_batch_wait_ms,
+    )
+
+    monkeypatch.delenv("COSYVOICE3_FLOW_BATCH", raising=False)
+    monkeypatch.delenv("COSYVOICE3_FLOW_BATCH_MAX_SIZE", raising=False)
+    monkeypatch.delenv("COSYVOICE3_FLOW_BATCH_WAIT_MS", raising=False)
+
+    assert _cosyvoice3_flow_batch_enabled() is False
+    assert _cosyvoice3_flow_batch_max_size() == 4
+    assert _cosyvoice3_flow_batch_wait_ms() == 10
 
 
 def test_resolve_flow_estimator_onnx_skips_fp32_fallback_for_fp16_flow(monkeypatch, tmp_path):

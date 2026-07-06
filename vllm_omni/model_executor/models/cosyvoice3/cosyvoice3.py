@@ -1034,6 +1034,8 @@ class CosyVoice3Model(
             if not isinstance(runtime_info, list):
                 runtime_info = []
 
+            jobs: list[dict[str, object]] = []
+
             for idx, req_ids in enumerate(request_ids_list):
                 raw = runtime_info[idx] if idx < len(runtime_info) and isinstance(runtime_info[idx], dict) else {}
                 payload = to_struct(raw)
@@ -1093,43 +1095,153 @@ class CosyVoice3Model(
                 )
                 if uses_streaming_decode:
                     token_offset = max(0, meta.left_context_size or 0)
-
                     cache_state = None
                     if req_id is not None and hasattr(self, "_stream_vocoder_cache_by_req"):
                         with self._stream_audio_cache_lock:
                             cache_state = self._stream_vocoder_cache_by_req.get(req_id)
-
-                    tts_speech, new_cache_state = self.code2wav.forward_streaming(
-                        token=token.unsqueeze(0),
-                        prompt_token=speech_token[:1],
-                        prompt_feat=speech_feat[:1],
-                        embedding=embedding[:1],
-                        cache_state=cache_state,
-                        n_timesteps=10,
-                        token_offset_tokens=token_offset,
-                        finalize=stream_finished,
+                    jobs.append(
+                        {
+                            "idx": idx,
+                            "req_id": req_id,
+                            "stream_finished": stream_finished,
+                            "uses_streaming_decode": True,
+                            "token": token.unsqueeze(0),
+                            "prompt_token": speech_token[:1],
+                            "prompt_feat": speech_feat[:1],
+                            "embedding": embedding[:1],
+                            "token_offset_tokens": token_offset,
+                            "cache_state": cache_state,
+                        }
                     )
-
-                    if req_id is not None and hasattr(self, "_stream_vocoder_cache_by_req"):
-                        with self._stream_audio_cache_lock:
-                            if new_cache_state is None or stream_finished:
-                                self._stream_vocoder_cache_by_req.pop(req_id, None)
-                            else:
-                                self._stream_vocoder_cache_by_req[req_id] = new_cache_state
                 else:
                     token_offset = max(0, meta.talker_prefill_offset or 0) if meta else 0
-                    tts_speech = self.code2wav.forward(
-                        token=token.unsqueeze(0),
-                        prompt_token=speech_token[:1],
-                        prompt_feat=speech_feat[:1],
-                        embedding=embedding[:1],
-                        n_timesteps=10,
-                        token_offset_tokens=token_offset,
+                    jobs.append(
+                        {
+                            "idx": idx,
+                            "req_id": req_id,
+                            "stream_finished": stream_finished,
+                            "uses_streaming_decode": False,
+                            "token": token.unsqueeze(0),
+                            "prompt_token": speech_token[:1],
+                            "prompt_feat": speech_feat[:1],
+                            "embedding": embedding[:1],
+                            "token_offset_tokens": token_offset,
+                            "cache_state": None,
+                        }
                     )
 
-                audio = tts_speech.reshape(-1).to(dtype=torch.float32)
+            def _store_stream_cache(job: dict[str, object], new_cache_state) -> None:
+                req_id = job["req_id"]
+                stream_finished = bool(job["stream_finished"])
+                if req_id is not None and hasattr(self, "_stream_vocoder_cache_by_req"):
+                    with self._stream_audio_cache_lock:
+                        if new_cache_state is None or stream_finished:
+                            self._stream_vocoder_cache_by_req.pop(req_id, None)
+                        else:
+                            self._stream_vocoder_cache_by_req[req_id] = new_cache_state
 
-                audios[idx] = self._stitch_stream_audio(req_id, audio, stream_finished)
+            def _run_single_job(job: dict[str, object]) -> None:
+                idx = int(job["idx"])
+                stream_finished = bool(job["stream_finished"])
+                if bool(job["uses_streaming_decode"]):
+                    tts_speech, new_cache_state = self.code2wav.forward_streaming(
+                        token=job["token"],
+                        prompt_token=job["prompt_token"],
+                        prompt_feat=job["prompt_feat"],
+                        embedding=job["embedding"],
+                        cache_state=job["cache_state"],
+                        n_timesteps=10,
+                        token_offset_tokens=int(job["token_offset_tokens"]),
+                        finalize=stream_finished,
+                    )
+                    _store_stream_cache(job, new_cache_state)
+                else:
+                    tts_speech = self.code2wav.forward(
+                        token=job["token"],
+                        prompt_token=job["prompt_token"],
+                        prompt_feat=job["prompt_feat"],
+                        embedding=job["embedding"],
+                        n_timesteps=10,
+                        token_offset_tokens=int(job["token_offset_tokens"]),
+                    )
+                audio = tts_speech.reshape(-1).to(dtype=torch.float32)
+                audios[idx] = self._stitch_stream_audio(job["req_id"], audio, stream_finished)
+
+            def _run_batch_group(group: list[dict[str, object]]) -> None:
+                if len(group) <= 1 or not hasattr(self.code2wav, "_forward_mel_batch"):
+                    for job in group:
+                        _run_single_job(job)
+                    return
+                try:
+                    batch_requests = [
+                        {
+                            "token": job["token"],
+                            "prompt_token": job["prompt_token"],
+                            "prompt_feat": job["prompt_feat"],
+                            "embedding": job["embedding"],
+                            "token_offset_tokens": int(job["token_offset_tokens"]),
+                            "streaming": bool(job["uses_streaming_decode"]),
+                            "finalize": bool(job["stream_finished"]) if bool(job["uses_streaming_decode"]) else True,
+                        }
+                        for job in group
+                    ]
+                    feats = self.code2wav._forward_mel_batch(batch_requests, n_timesteps=10)
+                    for job, feat in zip(group, feats):
+                        idx = int(job["idx"])
+                        stream_finished = bool(job["stream_finished"])
+                        if bool(job["uses_streaming_decode"]):
+                            tts_speech, new_cache_state = self.code2wav._streaming_audio_from_mel(
+                                feat,
+                                cache_state=job["cache_state"],
+                                finalize=stream_finished,
+                            )
+                            _store_stream_cache(job, new_cache_state)
+                        else:
+                            tts_speech = self.code2wav._audio_from_mel(feat)
+                        audio = tts_speech.reshape(-1).to(dtype=torch.float32)
+                        audios[idx] = self._stitch_stream_audio(job["req_id"], audio, stream_finished)
+                except Exception as exc:
+                    logger.warning(
+                        "CosyVoice3 code2wav flow batch failed (%s); falling back to per-request flow",
+                        exc,
+                    )
+                    if hasattr(self.code2wav, "_flow_batch_stats"):
+                        self.code2wav._flow_batch_stats["fallbacks"] += len(group)
+                    for job in group:
+                        _run_single_job(job)
+
+            from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import (
+                _cosyvoice3_flow_batch_enabled,
+                _cosyvoice3_flow_batch_max_size,
+                _cosyvoice3_flow_batch_wait_ms,
+            )
+
+            flow_batch_enabled = _cosyvoice3_flow_batch_enabled()
+            # Parsed for validation/logging compatibility. Cross-step delayed
+            # batching cannot safely return aligned outputs through this
+            # synchronous forward contract, so PR2 batches requests already
+            # present in the same Stage1 forward step.
+            _cosyvoice3_flow_batch_wait_ms()
+            if not flow_batch_enabled:
+                for job in jobs:
+                    _run_single_job(job)
+            else:
+                max_batch = _cosyvoice3_flow_batch_max_size()
+                pending: list[dict[str, object]] = []
+
+                def _compatible(a: dict[str, object], b: dict[str, object]) -> bool:
+                    return (
+                        bool(a["uses_streaming_decode"]) == bool(b["uses_streaming_decode"])
+                        and bool(a["stream_finished"]) == bool(b["stream_finished"])
+                    )
+
+                for job in jobs:
+                    if pending and (len(pending) >= max_batch or not _compatible(pending[0], job)):
+                        _run_batch_group(pending)
+                        pending = []
+                    pending.append(job)
+                if pending:
+                    _run_batch_group(pending)
 
             return OmniOutput(text_hidden_states=None, multimodal_outputs={"audio": audios, "sr": srs})
         else:

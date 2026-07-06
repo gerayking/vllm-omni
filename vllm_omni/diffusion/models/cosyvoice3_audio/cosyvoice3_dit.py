@@ -16,6 +16,7 @@ from vllm.logger import init_logger
 from x_transformers.x_transformers import RotaryEmbedding, apply_rotary_pos_emb
 
 from vllm_omni.diffusion.attention.layer import Attention as DiffusionAttention
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.model_executor.layers.timestep_embedding import DiTTimestepEmbedding
 
 logger = init_logger(__name__)
@@ -131,9 +132,23 @@ class DiTAttention(nn.Module):
         key = key.view(batch_size, seq_len, self.heads, self.dim_head)
         value = value.view(batch_size, seq_len, self.heads, self.dim_head)
 
+        attn_metadata = None
+        if mask is not None:
+            if mask.dim() == 2:
+                attn_mask = mask.bool()
+            elif mask.dim() == 4:
+                # DiT builds [B, 1, Q, K] from key-valid lengths. The key mask
+                # is identical for every query row, so keep the compact 2D
+                # representation expected by dense SDPA/Flash wrappers.
+                attn_mask = mask[:, 0, 0, :].bool()
+            else:
+                attn_mask = None
+            if attn_mask is not None:
+                attn_metadata = AttentionMetadata(attn_mask=attn_mask)
+
         # Use diffusion attention backend
         # The diffusion Attention layer expects (batch, seq, heads, head_dim)
-        out = self.attn(query, key, value, attn_metadata=None)
+        out = self.attn(query, key, value, attn_metadata=attn_metadata)
 
         # Reshape back: (batch, seq, dim)
         out = out.view(batch_size, seq_len, self.inner_dim)
