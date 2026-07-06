@@ -4,12 +4,14 @@
 from functools import partial
 
 import torch
+from torch.profiler import record_function
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
+    VarlenAttentionLayout,
 )
 from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
@@ -118,6 +120,52 @@ class FlashAttentionImpl(AttentionImpl):
         out_unpad = self._unwrap_flash_output(out_unpad)
         return _pad_input(out_unpad, indices_q, query.size(0), query_length)
 
+    def _forward_varlen_precomputed(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        layout: VarlenAttentionLayout,
+    ) -> torch.Tensor:
+        from vllm_omni.diffusion.attention.backends.utils.fa import (
+            _index_first_axis,
+            _pad_input,
+            flash_attn_varlen_func,
+        )
+
+        if (
+            query.size(0) != layout.batch_size
+            or key.size(0) != layout.batch_size
+            or query.size(1) != layout.padded_q_len
+            or key.size(1) != layout.padded_k_len
+        ):
+            raise ValueError(
+                "VarlenAttentionLayout shape mismatch: "
+                f"query={tuple(query.shape)} key={tuple(key.shape)} layout={layout}"
+            )
+
+        with record_function("cosyvoice3_attention:pack"):
+            q = _index_first_axis(query, layout.indices_q)
+            k = _index_first_axis(key, layout.indices_k)
+            v = _index_first_axis(value, layout.indices_k)
+
+        with record_function("cosyvoice3_attention:varlen_kernel"):
+            out_unpad = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=layout.cu_seqlens_q,
+                cu_seqlens_k=layout.cu_seqlens_k,
+                max_seqlen_q=layout.max_seqlen_q,
+                max_seqlen_k=layout.max_seqlen_k,
+                causal=self.causal,
+                softmax_scale=self.softmax_scale,
+            )
+            out_unpad = self._unwrap_flash_output(out_unpad)
+
+        with record_function("cosyvoice3_attention:unpack"):
+            return _pad_input(out_unpad, layout.indices_q, layout.batch_size, layout.padded_q_len)
+
     def _forward_varlen_dense(
         self,
         query: torch.Tensor,
@@ -182,6 +230,7 @@ class FlashAttentionImpl(AttentionImpl):
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
+        varlen_layout = attn_metadata.extra.get("varlen") if attn_metadata is not None else None
 
         # Try piecewise attention
         if full_attn_spans is not None:
@@ -201,6 +250,13 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         if attention_mask is not None and torch.any(~attention_mask):
+            if isinstance(varlen_layout, VarlenAttentionLayout):
+                return self._forward_varlen_precomputed(
+                    query,
+                    key,
+                    value,
+                    varlen_layout,
+                )
             return self._forward_varlen_masked(
                 query,
                 key,
@@ -244,8 +300,16 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        varlen_layout = attn_metadata.extra.get("varlen") if attn_metadata is not None else None
 
         if attention_mask is not None and torch.any(~attention_mask):
+            if isinstance(varlen_layout, VarlenAttentionLayout):
+                return self._forward_varlen_precomputed(
+                    query,
+                    key,
+                    value,
+                    varlen_layout,
+                )
             return self._forward_varlen_masked(
                 query,
                 key,

@@ -6,17 +6,19 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import torch.nn.functional as F
 from diffusers.models.normalization import AdaLayerNormZero
 from einops import repeat
 from torch import nn
+from torch.profiler import record_function
 from vllm.logger import init_logger
 from x_transformers.x_transformers import RotaryEmbedding, apply_rotary_pos_emb
 
 from vllm_omni.diffusion.attention.layer import Attention as DiffusionAttention
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VarlenAttentionLayout
 from vllm_omni.model_executor.layers.timestep_embedding import DiTTimestepEmbedding
 
 logger = init_logger(__name__)
@@ -51,6 +53,50 @@ def get_pos_embed_indices(start, length, max_pos, scale=1.0):
     )
     pos = torch.where(pos < max_pos, pos, max_pos - 1)
     return pos
+
+
+def _cosyvoice3_varlen_attention_enabled() -> bool:
+    value = os.getenv("COSYVOICE3_VARLEN_ATTENTION", "0").strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
+def _right_padded_varlen_layout(attn_mask: torch.Tensor) -> VarlenAttentionLayout | None:
+    if attn_mask.ndim != 2 or attn_mask.numel() == 0:
+        return None
+    attn_mask = attn_mask.to(torch.bool)
+    if not torch.any(~attn_mask):
+        return None
+
+    batch_size, seq_len = attn_mask.shape
+    seqlens = attn_mask.sum(dim=1, dtype=torch.int32)
+    positions = torch.arange(seq_len, device=attn_mask.device, dtype=torch.long).unsqueeze(0)
+    offsets = (torch.arange(batch_size, device=attn_mask.device, dtype=torch.long) * seq_len).unsqueeze(1)
+    valid = positions < seqlens.to(torch.long).unsqueeze(1)
+    indices = (offsets + positions).masked_select(valid)
+    cu_seqlens = F.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0))
+    max_seqlen = int(seqlens.max().item())
+    return VarlenAttentionLayout(
+        indices_q=indices,
+        indices_k=indices,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_k=max_seqlen,
+        batch_size=batch_size,
+        padded_q_len=seq_len,
+        padded_k_len=seq_len,
+    )
+
+
+def _attention_metadata_from_mask(attn_mask: torch.Tensor | None) -> AttentionMetadata | None:
+    if attn_mask is None:
+        return None
+    extra = {}
+    if _cosyvoice3_varlen_attention_enabled():
+        layout = _right_padded_varlen_layout(attn_mask)
+        if layout is not None:
+            extra["varlen"] = layout
+    return AttentionMetadata(attn_mask=attn_mask, extra=extra)
 
 
 class FeedForward(nn.Module):
@@ -112,28 +158,30 @@ class DiTAttention(nn.Module):
         x: torch.Tensor,
         mask: torch.Tensor | None = None,
         rope=None,
+        attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len = x.shape[0], x.shape[1]
 
         # Project to Q, K, V
-        query = self.to_q(x)
-        key = self.to_k(x)
-        value = self.to_v(x)
+        with record_function("cosyvoice3_attention:qkv_projection"):
+            query = self.to_q(x)
+            key = self.to_k(x)
+            value = self.to_v(x)
 
         # Apply rotary position embedding
         if rope is not None:
-            freqs, xpos_scale = rope
-            q_xpos_scale, k_xpos_scale = (xpos_scale, xpos_scale**-1.0) if xpos_scale is not None else (1.0, 1.0)
-            query = apply_rotary_pos_emb(query, freqs, q_xpos_scale)
-            key = apply_rotary_pos_emb(key, freqs, k_xpos_scale)
+            with record_function("cosyvoice3_attention:rope"):
+                freqs, xpos_scale = rope
+                q_xpos_scale, k_xpos_scale = (xpos_scale, xpos_scale**-1.0) if xpos_scale is not None else (1.0, 1.0)
+                query = apply_rotary_pos_emb(query, freqs, q_xpos_scale)
+                key = apply_rotary_pos_emb(key, freqs, k_xpos_scale)
 
         # Reshape for attention: (batch, seq, heads, head_dim)
         query = query.view(batch_size, seq_len, self.heads, self.dim_head)
         key = key.view(batch_size, seq_len, self.heads, self.dim_head)
         value = value.view(batch_size, seq_len, self.heads, self.dim_head)
 
-        attn_metadata = None
-        if mask is not None:
+        if attn_metadata is None and mask is not None:
             if mask.dim() == 2:
                 attn_mask = mask.bool()
             elif mask.dim() == 4:
@@ -144,18 +192,20 @@ class DiTAttention(nn.Module):
             else:
                 attn_mask = None
             if attn_mask is not None:
-                attn_metadata = AttentionMetadata(attn_mask=attn_mask)
+                attn_metadata = _attention_metadata_from_mask(attn_mask)
 
         # Use diffusion attention backend
         # The diffusion Attention layer expects (batch, seq, heads, head_dim)
-        out = self.attn(query, key, value, attn_metadata=attn_metadata)
+        with record_function("cosyvoice3_attention:backend_full"):
+            out = self.attn(query, key, value, attn_metadata=attn_metadata)
 
         # Reshape back: (batch, seq, dim)
         out = out.view(batch_size, seq_len, self.inner_dim)
         out = out.to(query.dtype)
 
         # Output projection
-        out = self.to_out(out)
+        with record_function("cosyvoice3_attention:out_projection"):
+            out = self.to_out(out)
 
         # Apply mask if provided
         if mask is not None:
@@ -186,12 +236,12 @@ class DiTBlock(nn.Module):
         self.ff_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.ff = FeedForward(dim=dim, mult=ff_mult, dropout=dropout, approximate="tanh")
 
-    def forward(self, x, t, mask=None, rope=None):
+    def forward(self, x, t, mask=None, rope=None, attn_metadata: AttentionMetadata | None = None):
         # pre-norm & modulation for attention input
         norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, emb=t)
 
         # attention
-        attn_output = self.attn(x=norm, mask=mask, rope=rope)
+        attn_output = self.attn(x=norm, mask=mask, rope=rope, attn_metadata=attn_metadata)
 
         # process attention output for input x
         x = x + gate_msa.unsqueeze(1) * attn_output
@@ -417,10 +467,12 @@ class DiT(nn.Module):
         if self.long_skip_connection is not None:
             residual = x
 
-        attn_mask = mask.bool().repeat(1, x.size(1), 1).unsqueeze(dim=1)
+        key_mask = mask.squeeze(1).bool()
+        attn_mask = key_mask.repeat(1, x.size(1), 1).unsqueeze(dim=1)
+        attn_metadata = _attention_metadata_from_mask(key_mask)
 
         for block in self.transformer_blocks:
-            x = block(x, t, mask=attn_mask.bool(), rope=rope)
+            x = block(x, t, mask=attn_mask.bool(), rope=rope, attn_metadata=attn_metadata)
 
         if self.long_skip_connection is not None:
             x = self.long_skip_connection(torch.cat((x, residual), dim=-1))

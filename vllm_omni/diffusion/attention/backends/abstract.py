@@ -77,6 +77,26 @@ class AttentionMetadata:
     full_attn_spans: list[list[tuple[int, int]]] | None = None
 
 
+@dataclass(frozen=True)
+class VarlenAttentionLayout:
+    """Precomputed right-padded varlen attention layout.
+
+    This lets model code build sequence indices/cu_seqlens once per forward
+    and reuse them across transformer layers instead of re-parsing masks in
+    every attention backend call.
+    """
+
+    indices_q: torch.Tensor
+    indices_k: torch.Tensor
+    cu_seqlens_q: torch.Tensor
+    cu_seqlens_k: torch.Tensor
+    max_seqlen_q: int
+    max_seqlen_k: int
+    batch_size: int
+    padded_q_len: int
+    padded_k_len: int
+
+
 T = TypeVar("T", bound=AttentionMetadata)
 
 

@@ -127,6 +127,66 @@ class TestDiTAttention:
         assert out.shape == x.shape
         assert captured["attn_metadata"].attn_mask.tolist() == key_mask.tolist()
 
+    @pytest.mark.core_model
+    @pytest.mark.cpu
+    def test_forward_adds_varlen_layout_when_enabled(self, monkeypatch):
+        from vllm_omni.diffusion.models.cosyvoice3_audio.cosyvoice3_dit import DiTAttention
+
+        captured = {}
+
+        class RecordingAttention(nn.Module):
+            def forward(self, query, key, value, attn_metadata=None):
+                captured["attn_metadata"] = attn_metadata
+                return torch.zeros_like(query)
+
+        monkeypatch.setenv("COSYVOICE3_VARLEN_ATTENTION", "1")
+        attn = DiTAttention(dim=8, heads=2, dim_head=4, dropout=0.0)
+        attn.attn = RecordingAttention()
+        x = torch.randn(2, 5, 8)
+        mask = torch.tensor(
+            [
+                [True, True, True, False, False],
+                [True, True, True, True, False],
+            ]
+        )
+
+        out = attn(x, mask=mask)
+
+        varlen = captured["attn_metadata"].extra["varlen"]
+        assert out.shape == x.shape
+        assert varlen.batch_size == 2
+        assert varlen.padded_q_len == 5
+        assert varlen.max_seqlen_q == 4
+        assert varlen.cu_seqlens_q.tolist() == [0, 3, 7]
+        assert varlen.indices_q.tolist() == [0, 1, 2, 5, 6, 7, 8]
+
+    @pytest.mark.core_model
+    @pytest.mark.cpu
+    def test_forward_keeps_varlen_layout_disabled_by_default(self, monkeypatch):
+        from vllm_omni.diffusion.models.cosyvoice3_audio.cosyvoice3_dit import DiTAttention
+
+        captured = {}
+
+        class RecordingAttention(nn.Module):
+            def forward(self, query, key, value, attn_metadata=None):
+                captured["attn_metadata"] = attn_metadata
+                return torch.zeros_like(query)
+
+        monkeypatch.delenv("COSYVOICE3_VARLEN_ATTENTION", raising=False)
+        attn = DiTAttention(dim=8, heads=2, dim_head=4, dropout=0.0)
+        attn.attn = RecordingAttention()
+        x = torch.randn(2, 5, 8)
+        mask = torch.tensor(
+            [
+                [True, True, True, False, False],
+                [True, True, True, True, False],
+            ]
+        )
+
+        attn(x, mask=mask)
+
+        assert "varlen" not in captured["attn_metadata"].extra
+
 
 class TestDiTBlock:
     """Tests for DiTBlock."""
