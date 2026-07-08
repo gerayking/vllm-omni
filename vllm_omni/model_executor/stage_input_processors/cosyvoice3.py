@@ -51,6 +51,25 @@ def _ensure_list(x: Any) -> list[Any]:
         return [x]
 
 
+def _decode_speaker_value(value: Any) -> str | list[str] | None:
+    if isinstance(value, str):
+        return value if value else None
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return None
+        data = value.detach().to(device="cpu", dtype=torch.uint8).reshape(-1).tolist()
+        try:
+            speaker = bytes(int(x) for x in data).decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        return speaker or None
+    if isinstance(value, (list, tuple)):
+        speakers = [_decode_speaker_value(item) for item in value]
+        flat = [item for item in speakers if isinstance(item, str) and item]
+        return flat or None
+    return None
+
+
 def _to_token_id_list(value: Any) -> list[int]:
     if value is None:
         return []
@@ -175,6 +194,7 @@ def talker2code2wav_async_chunk(
             with nullcontext():
                 info = _decode_additional_information(getattr(request, "additional_information", None))
                 info_embed = info.get("embed", {}) if isinstance(info, dict) else {}
+                speaker = _decode_speaker_value(info.get("speaker")) if isinstance(info, dict) else None
                 prompt_payload = {}
                 cond_keys = ("speech_token", "speech_feat", "embedding", "speech_token_len")
                 for key in cond_keys:
@@ -182,6 +202,8 @@ def talker2code2wav_async_chunk(
                     if value is not None:
                         prompt_payload[key] = value
                 if isinstance(multimodal_output, Mapping):
+                    if speaker is None:
+                        speaker = _decode_speaker_value(multimodal_output.get("speaker"))
                     mm_embed = multimodal_output.get("embed", {})
                     if not isinstance(mm_embed, Mapping):
                         mm_embed = multimodal_output
@@ -227,6 +249,7 @@ def talker2code2wav_async_chunk(
                     "stream_scale_factor": stream_scale_factor,
                     "terminal_sent": False,
                     "prompt_payload": prompt_payload,
+                    "speaker": speaker if isinstance(speaker, (str, list)) else None,
                 }
             }
             transfer_manager.request_payload[request_id] = request_state
@@ -262,6 +285,7 @@ def talker2code2wav_async_chunk(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
                 meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
                 embed=embed_struct,
+                speaker=state.get("speaker"),
             )
 
         emitted_token_len = int(state.get("emitted_token_len", 0))
@@ -275,6 +299,7 @@ def talker2code2wav_async_chunk(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
                 meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
                 embed=embed_struct,
+                speaker=state.get("speaker"),
             )
 
         with nullcontext():
@@ -313,6 +338,7 @@ def talker2code2wav_async_chunk(
                 left_context_size=token_offset,
             ),
             embed=embed_struct,
+            speaker=state.get("speaker"),
         )
 
         if not finished:

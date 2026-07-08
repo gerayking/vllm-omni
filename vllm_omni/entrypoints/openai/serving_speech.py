@@ -3218,20 +3218,25 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "prompt_text": ref_text,
             "sample_rate": sr,
         }
+        additional_information: dict[str, Any] = {}
         # Pass voice metadata for caching in the processor
         if request.voice:
             voice_lower = request.voice.lower()
             if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
                 mm_kwargs["voice_name"] = voice_lower
                 mm_kwargs["voice_created_at"] = self._voice_created_at(voice_lower)
+                additional_information["speaker"] = voice_lower
 
-        return {
+        prompt = {
             "prompt": request.input,
             "multi_modal_data": {
                 "audio": audio_data,
             },
             "mm_processor_kwargs": mm_kwargs,
         }
+        if additional_information:
+            prompt["additional_information"] = additional_information
+        return prompt
 
     # ---- Covo-Audio helpers ----
 

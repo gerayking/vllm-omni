@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
+from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from functools import partial
 from math import gcd
 from threading import Lock
@@ -71,6 +73,100 @@ def _cosyvoice3_trt_enabled() -> bool:
     them — export ``COSYVOICE3_TRT=0`` in the launching shell to disable.
     """
     return os.environ.get("COSYVOICE3_TRT", "1") not in ("0", "false", "False", "")
+
+
+def _cosyvoice3_prompt_prefix_cache_max_size() -> int:
+    value = os.environ.get("COSYVOICE3_PROMPT_PREFIX_CACHE_MAX_SIZE", "16")
+    try:
+        return max(0, int(value))
+    except ValueError:
+        logger.warning(
+            "CosyVoice3 prompt prefix cache: unsupported COSYVOICE3_PROMPT_PREFIX_CACHE_MAX_SIZE=%r; using 16",
+            value,
+        )
+        return 16
+
+
+def _encode_speaker_to_tensor(speaker: str) -> torch.Tensor:
+    return torch.tensor(list(speaker.encode("utf-8")), dtype=torch.uint8)
+
+
+@dataclass
+class CosyVoice3PromptPrefixCacheEntry:
+    prompt_token: torch.Tensor
+    prompt_feat: torch.Tensor
+    embedding: torch.Tensor
+
+
+class CosyVoice3PromptPrefixCache:
+    """LRU cache for immutable prompt/reference conditioning keyed by spk_id."""
+
+    def __init__(self, *, max_size: int = 16) -> None:
+        self.max_size = max(0, int(max_size))
+        self._cache: OrderedDict[str, CosyVoice3PromptPrefixCacheEntry] = OrderedDict()
+        self._stats: dict[str, int] = {
+            "hits": 0,
+            "misses": 0,
+            "bypasses": 0,
+            "evictions": 0,
+        }
+
+    def stats(self) -> dict[str, int | float]:
+        stats: dict[str, int | float] = dict(self._stats)
+        stats["cache_size"] = len(self._cache)
+        lookups = self._stats["hits"] + self._stats["misses"]
+        stats["hit_rate"] = float(self._stats["hits"] / lookups) if lookups > 0 else 0.0
+        return stats
+
+    def get(self, spk_id: str | None) -> CosyVoice3PromptPrefixCacheEntry | None:
+        if self.max_size <= 0 or not spk_id:
+            self._stats["bypasses"] += 1
+            self._log_stats("bypass", spk_id)
+            return None
+        entry = self._cache.get(spk_id)
+        if entry is None:
+            self._stats["misses"] += 1
+            self._log_stats("miss", spk_id)
+            return None
+        self._cache.move_to_end(spk_id)
+        self._stats["hits"] += 1
+        self._log_stats("hit", spk_id)
+        return entry
+
+    def put(
+        self,
+        spk_id: str | None,
+        *,
+        prompt_token: torch.Tensor,
+        prompt_feat: torch.Tensor,
+        embedding: torch.Tensor,
+    ) -> None:
+        if self.max_size <= 0 or not spk_id:
+            return
+        self._cache[spk_id] = CosyVoice3PromptPrefixCacheEntry(
+            prompt_token=prompt_token,
+            prompt_feat=prompt_feat,
+            embedding=embedding,
+        )
+        self._cache.move_to_end(spk_id)
+        while len(self._cache) > self.max_size:
+            evicted, _ = self._cache.popitem(last=False)
+            self._stats["evictions"] += 1
+            self._log_stats("evict", evicted)
+
+    def _log_stats(self, event: str, spk_id: str | None) -> None:
+        stats = self.stats()
+        logger.info(
+            "CosyVoice3 prompt prefix cache %s spk_id=%s hits=%d misses=%d "
+            "evictions=%d cache_size=%d hit_rate=%.3f",
+            event,
+            spk_id,
+            stats["hits"],
+            stats["misses"],
+            stats["evictions"],
+            stats["cache_size"],
+            stats["hit_rate"],
+        )
 
 
 class CosyVoice3MultiModalProcessingInfo(BaseProcessingInfo):
@@ -482,8 +578,15 @@ class CosyVoice3Model(
 
             self._stream_audio_cache_lock = Lock()
             self._stream_vocoder_cache_by_req: dict[str, dict[str, torch.Tensor]] = {}
+            self._prompt_prefix_cache = CosyVoice3PromptPrefixCache(
+                max_size=_cosyvoice3_prompt_prefix_cache_max_size()
+            )
         else:
             raise ValueError(f"Model stage not supported {self.model_stage}")
+
+    def get_prompt_prefix_cache_stats(self) -> dict[str, int | float]:
+        cache = getattr(self, "_prompt_prefix_cache", None)
+        return cache.stats() if cache is not None else {}
 
     def get_language_model(self) -> "nn.Module":
         """Return the language model for upstream MoE detection."""
@@ -998,6 +1101,27 @@ class CosyVoice3Model(
                         kwargs.get("speech_token_len"),
                     )
                 )
+                runtime_info = kwargs.get("model_intermediate_buffer")
+                if runtime_info is None:
+                    runtime_info = kwargs.get("runtime_additional_information")
+                speaker_list: list[str] = []
+                if isinstance(runtime_info, list):
+                    for raw in runtime_info[: len(speech_token_list)]:
+                        speaker = raw.get("speaker") if isinstance(raw, dict) else None
+                        if isinstance(speaker, list):
+                            speaker = speaker[0] if speaker and isinstance(speaker[0], str) else None
+                        speaker_list.append(speaker if isinstance(speaker, str) else "")
+                elif isinstance(additional_information, dict):
+                    speaker = additional_information.get("speaker")
+                    if isinstance(speaker, list):
+                        speaker = speaker[0] if speaker and isinstance(speaker[0], str) else None
+                    speaker_list = [speaker if isinstance(speaker, str) else ""] * len(speech_token_list)
+                if speaker_list and len(speaker_list) < len(speech_token_list):
+                    speaker_list.extend([""] * (len(speech_token_list) - len(speaker_list)))
+                speaker_tensors = [
+                    _encode_speaker_to_tensor(speaker) if speaker else torch.empty((0,), dtype=torch.uint8)
+                    for speaker in speaker_list
+                ]
                 multimodal_outputs = to_dict(
                     OmniPayloadStruct(
                         embed=EmbeddingsStruct(
@@ -1006,6 +1130,7 @@ class CosyVoice3Model(
                             speech_token_len=speech_token_len_list,
                             embedding=embedding_list,
                         ),
+                        speaker=speaker_tensors if any(speaker_list) else None,
                     )
                 )
 
@@ -1041,19 +1166,45 @@ class CosyVoice3Model(
                 payload = to_struct(raw)
                 meta = payload.meta
                 embed = payload.embed
+                speaker = payload.speaker
+                spk_id = None
+                if isinstance(speaker, str) and speaker:
+                    spk_id = speaker
+                elif isinstance(speaker, list) and speaker and isinstance(speaker[0], str) and speaker[0]:
+                    spk_id = speaker[0]
 
                 req_id = meta.req_id[0] if (meta and meta.req_id) else None
                 stream_finished = (
                     bool(meta.stream_finished.item()) if (meta and meta.stream_finished is not None) else False
                 )
-                speech_token = embed.speech_token if embed else None
-                speech_feat = embed.speech_feat if embed else None
-                embedding = embed.embedding if embed else None
-                # Drop any right-padding carried from batched talker emission.
-                if speech_token is not None and speech_feat is not None:
-                    speech_token, speech_feat = unpad_prompt_conditioning(
-                        speech_token, speech_feat, embed.speech_token_len if embed else None
-                    )
+                prefix_cache = getattr(self, "_prompt_prefix_cache", None)
+                prefix_entry = prefix_cache.get(spk_id) if prefix_cache is not None else None
+                if prefix_entry is not None:
+                    speech_token = prefix_entry.prompt_token
+                    speech_feat = prefix_entry.prompt_feat
+                    embedding = prefix_entry.embedding
+                else:
+                    speech_token = embed.speech_token if embed else None
+                    speech_feat = embed.speech_feat if embed else None
+                    embedding = embed.embedding if embed else None
+                    # Drop any right-padding carried from batched talker emission.
+                    if speech_token is not None and speech_feat is not None:
+                        speech_token, speech_feat = unpad_prompt_conditioning(
+                            speech_token, speech_feat, embed.speech_token_len if embed else None
+                        )
+                    if (
+                        prefix_cache is not None
+                        and spk_id is not None
+                        and speech_token is not None
+                        and speech_feat is not None
+                        and embedding is not None
+                    ):
+                        prefix_cache.put(
+                            spk_id,
+                            prompt_token=speech_token,
+                            prompt_feat=speech_feat,
+                            embedding=embedding,
+                        )
                 if speech_token is None or speech_feat is None or embedding is None:
                     if stream_finished and req_id is not None and hasattr(self, "_stream_vocoder_cache_by_req"):
                         with self._stream_audio_cache_lock:
@@ -1109,6 +1260,7 @@ class CosyVoice3Model(
                             "prompt_token": speech_token[:1],
                             "prompt_feat": speech_feat[:1],
                             "embedding": embedding[:1],
+                            "spk_id": spk_id,
                             "token_offset_tokens": token_offset,
                             "cache_state": cache_state,
                         }
@@ -1125,6 +1277,7 @@ class CosyVoice3Model(
                             "prompt_token": speech_token[:1],
                             "prompt_feat": speech_feat[:1],
                             "embedding": embedding[:1],
+                            "spk_id": spk_id,
                             "token_offset_tokens": token_offset,
                             "cache_state": None,
                         }
@@ -1153,6 +1306,7 @@ class CosyVoice3Model(
                         n_timesteps=10,
                         token_offset_tokens=int(job["token_offset_tokens"]),
                         finalize=stream_finished,
+                        spk_id=job["spk_id"] if isinstance(job.get("spk_id"), str) else None,
                     )
                     _store_stream_cache(job, new_cache_state)
                 else:
@@ -1163,6 +1317,7 @@ class CosyVoice3Model(
                         embedding=job["embedding"],
                         n_timesteps=10,
                         token_offset_tokens=int(job["token_offset_tokens"]),
+                        spk_id=job["spk_id"] if isinstance(job.get("spk_id"), str) else None,
                     )
                 audio = tts_speech.reshape(-1).to(dtype=torch.float32)
                 audios[idx] = self._stitch_stream_audio(job["req_id"], audio, stream_finished)
@@ -1179,6 +1334,7 @@ class CosyVoice3Model(
                             "prompt_token": job["prompt_token"],
                             "prompt_feat": job["prompt_feat"],
                             "embedding": job["embedding"],
+                            "spk_id": job["spk_id"] if isinstance(job.get("spk_id"), str) else None,
                             "token_offset_tokens": int(job["token_offset_tokens"]),
                             "streaming": bool(job["uses_streaming_decode"]),
                             "finalize": bool(job["stream_finished"]) if bool(job["uses_streaming_decode"]) else True,

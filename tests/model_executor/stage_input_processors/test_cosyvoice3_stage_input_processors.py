@@ -161,6 +161,70 @@ def test_talker2code2wav_async_chunk_final_payload_uses_absolute_token_offset():
     assert payload.embed.embedding is not None
 
 
+def test_talker2code2wav_async_chunk_preserves_speaker_for_prefix_cache():
+    transfer_manager = _transfer_manager()
+    request = SimpleNamespace(
+        external_req_id="rid-speaker",
+        output_token_ids=[1, 2],
+        additional_information={
+            "speaker": "speaker-a",
+            "embed": {
+                "speech_token": [torch.tensor([[11, 12]])],
+                "speech_feat": [torch.tensor([[[0.1, 0.2], [0.3, 0.4]]])],
+                "embedding": [torch.tensor([[0.5, 0.6]])],
+            },
+        },
+        is_finished=lambda: False,
+    )
+
+    first = talker2code2wav_async_chunk(
+        transfer_manager=transfer_manager,
+        multimodal_output=None,
+        request=request,
+        is_finished=False,
+    )
+    request.output_token_ids = [1, 2, 3, 4]
+    second = talker2code2wav_async_chunk(
+        transfer_manager=transfer_manager,
+        multimodal_output=None,
+        request=request,
+        is_finished=False,
+    )
+
+    assert first is not None
+    assert second is not None
+    assert first.speaker == "speaker-a"
+    assert second.speaker == "speaker-a"
+    assert first.embed is not None
+    assert second.embed is None
+
+
+def test_talker2code2wav_async_chunk_decodes_tensor_speaker_for_prefix_cache():
+    transfer_manager = _transfer_manager()
+    request = SimpleNamespace(
+        external_req_id="rid-speaker-tensor",
+        output_token_ids=[1, 2],
+        additional_information={
+            "embed": {
+                "speech_token": [torch.tensor([[11, 12]])],
+                "speech_feat": [torch.tensor([[[0.1, 0.2], [0.3, 0.4]]])],
+                "embedding": [torch.tensor([[0.5, 0.6]])],
+            },
+        },
+        is_finished=lambda: False,
+    )
+
+    payload = talker2code2wav_async_chunk(
+        transfer_manager=transfer_manager,
+        multimodal_output={"speaker": torch.tensor(list(b"bench_voice"), dtype=torch.uint8)},
+        request=request,
+        is_finished=False,
+    )
+
+    assert payload is not None
+    assert payload.speaker == "bench_voice"
+
+
 def test_talker2code2wav_async_chunk_emits_eof_when_finished_without_valid_codes():
     transfer_manager = _transfer_manager(chunk_frames=25)
     request = SimpleNamespace(

@@ -216,6 +216,7 @@ class CosyVoice3Code2Wav(nn.Module):
         token_offset_tokens: int = 0,
         streaming: bool = True,
         finalize: bool = False,
+        spk_id: str | None = None,
     ) -> torch.Tensor:
         """Generate mel features via the upstream flow-model inference path."""
         flow_weight = next(self.flow_model.parameters())
@@ -409,6 +410,7 @@ class CosyVoice3Code2Wav(nn.Module):
         n_timesteps: int = 10,
         token_offset_tokens: int = 0,
         finalize: bool = False,
+        spk_id: str | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
         """Decode streaming audio using cumulative mel + emitted-speech offset.
 
@@ -427,6 +429,7 @@ class CosyVoice3Code2Wav(nn.Module):
             token_offset_tokens=token_offset_tokens,
             streaming=True,
             finalize=finalize,
+            spk_id=spk_id,
         )
         return self._streaming_audio_from_mel(feat, cache_state=cache_state, finalize=finalize)
 
@@ -439,6 +442,7 @@ class CosyVoice3Code2Wav(nn.Module):
         embedding: torch.Tensor,
         n_timesteps: int = 10,
         token_offset_tokens: int = 0,
+        spk_id: str | None = None,
     ) -> torch.Tensor:
         """Generate audio waveform from speech tokens."""
         feat = self._forward_mel(
@@ -450,6 +454,7 @@ class CosyVoice3Code2Wav(nn.Module):
             token_offset_tokens=token_offset_tokens,
             streaming=False,
             finalize=True,
+            spk_id=spk_id,
         )
 
         return self._audio_from_mel(feat)

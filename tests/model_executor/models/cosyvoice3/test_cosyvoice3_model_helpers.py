@@ -145,6 +145,9 @@ def _make_code2wav_model(
     model._stream_audio_cache_by_req = {}
     model._stream_audio_cache_lock = Lock()
     model._stream_vocoder_cache_by_req = {}
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3PromptPrefixCache
+
+    model._prompt_prefix_cache = CosyVoice3PromptPrefixCache(max_size=16)
     return model
 
 
@@ -485,6 +488,243 @@ def test_forward_reuses_streaming_cache_state_between_chunks():
     assert "rid-stream" in model._stream_vocoder_cache_by_req
 
 
+def test_forward_reuses_prompt_prefix_cache_for_same_speaker_without_embed(caplog):
+    caplog.set_level("INFO")
+    model = _make_code2wav_model()
+    prompt_token = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    prompt_feat = torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32)
+    embedding = torch.tensor([[0.5, 0.6]], dtype=torch.float32)
+
+    first_info = [
+        {
+            "speaker": "speaker-a",
+            "embed": {
+                "speech_token": prompt_token,
+                "speech_feat": prompt_feat,
+                "embedding": embedding,
+            },
+            "meta": {
+                "req_id": ["rid-stream"],
+                "stream_finished": torch.tensor(False),
+                "left_context_size": 0,
+            },
+        }
+    ]
+    second_info = [
+        {
+            "speaker": "speaker-a",
+            "meta": {
+                "req_id": ["rid-stream"],
+                "stream_finished": torch.tensor(False),
+                "left_context_size": 1,
+            },
+        }
+    ]
+
+    model.forward(
+        input_ids=torch.tensor([0, 1, 2], dtype=torch.long),
+        positions=torch.tensor([0, 1, 2], dtype=torch.long),
+        model_intermediate_buffer=first_info,
+        seq_token_counts=[3],
+    )
+    model.forward(
+        input_ids=torch.tensor([0, 1, 2], dtype=torch.long),
+        positions=torch.tensor([0, 1, 2], dtype=torch.long),
+        model_intermediate_buffer=second_info,
+        seq_token_counts=[3],
+    )
+
+    assert len(model.code2wav.forward_streaming_calls) == 2
+    second_call = model.code2wav.forward_streaming_calls[1]
+    assert second_call["prompt_token"].untyped_storage().data_ptr() == prompt_token.untyped_storage().data_ptr()
+    assert second_call["prompt_feat"].untyped_storage().data_ptr() == prompt_feat.untyped_storage().data_ptr()
+    assert second_call["embedding"].untyped_storage().data_ptr() == embedding.untyped_storage().data_ptr()
+    assert second_call["token_offset_tokens"] == 1
+
+    stats = model.get_prompt_prefix_cache_stats()
+    assert stats["misses"] == 1
+    assert stats["hits"] == 1
+    assert stats["cache_size"] == 1
+    assert stats["hit_rate"] == 0.5
+    assert "hit_rate=0.500" in caplog.text
+
+
+def test_forward_prompt_prefix_cache_defaults_to_capacity_16():
+    model = _make_code2wav_model()
+
+    assert model._prompt_prefix_cache.max_size == 16
+
+
+def test_prompt_prefix_cache_capacity_env_accepts_zero(monkeypatch):
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import (
+        _cosyvoice3_prompt_prefix_cache_max_size,
+    )
+
+    monkeypatch.setenv("COSYVOICE3_PROMPT_PREFIX_CACHE_MAX_SIZE", "0")
+
+    assert _cosyvoice3_prompt_prefix_cache_max_size() == 0
+
+
+def test_prompt_prefix_cache_capacity_zero_disables_storage():
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import (
+        CosyVoice3PromptPrefixCache,
+    )
+
+    cache = CosyVoice3PromptPrefixCache(max_size=0)
+    token = torch.tensor([[1, 2]], dtype=torch.long)
+    feat = torch.ones((1, 2, 2), dtype=torch.float32)
+    embedding = torch.ones((1, 2), dtype=torch.float32)
+
+    assert cache.get("speaker-a") is None
+    cache.put("speaker-a", prompt_token=token, prompt_feat=feat, embedding=embedding)
+
+    assert cache.get("speaker-a") is None
+    stats = cache.stats()
+    assert stats["cache_size"] == 0
+    assert stats["hits"] == 0
+
+
+def test_forward_prompt_prefix_cache_logs_bypass_without_speaker(caplog):
+    caplog.set_level("INFO")
+    model = _make_code2wav_model()
+
+    model.forward(
+        input_ids=torch.tensor([0, 1], dtype=torch.long),
+        positions=torch.tensor([0, 1], dtype=torch.long),
+        model_intermediate_buffer=[
+            {
+                "embed": {
+                    "speech_token": torch.tensor([[1, 2]], dtype=torch.long),
+                    "speech_feat": torch.ones((1, 2, 2), dtype=torch.float32),
+                    "embedding": torch.ones((1, 2), dtype=torch.float32),
+                },
+                "meta": {"left_context_size": 0},
+            }
+        ],
+        seq_token_counts=[2],
+    )
+
+    stats = model.get_prompt_prefix_cache_stats()
+    assert stats["bypasses"] == 1
+    assert "CosyVoice3 prompt prefix cache bypass spk_id=None" in caplog.text
+
+
+def test_forward_prompt_prefix_cache_keeps_speakers_isolated():
+    model = _make_code2wav_model()
+    prompt_a = torch.tensor([[1, 2]], dtype=torch.long)
+    prompt_feat_a = torch.ones((1, 2, 2), dtype=torch.float32)
+    embedding_a = torch.ones((1, 2), dtype=torch.float32)
+    prompt_b = torch.tensor([[3, 4, 5]], dtype=torch.long)
+    prompt_feat_b = torch.full((1, 3, 2), 2.0, dtype=torch.float32)
+    embedding_b = torch.full((1, 2), 3.0, dtype=torch.float32)
+
+    for speaker, prompt_token, prompt_feat, embedding in (
+        ("speaker-a", prompt_a, prompt_feat_a, embedding_a),
+        ("speaker-b", prompt_b, prompt_feat_b, embedding_b),
+    ):
+        model.forward(
+            input_ids=torch.tensor([0, 1], dtype=torch.long),
+            positions=torch.tensor([0, 1], dtype=torch.long),
+            model_intermediate_buffer=[
+                {
+                    "speaker": speaker,
+                    "embed": {
+                        "speech_token": prompt_token,
+                        "speech_feat": prompt_feat,
+                        "embedding": embedding,
+                    },
+                    "meta": {"left_context_size": 0},
+                }
+            ],
+            seq_token_counts=[2],
+        )
+
+    model.forward(
+        input_ids=torch.tensor([0, 1], dtype=torch.long),
+        positions=torch.tensor([0, 1], dtype=torch.long),
+        model_intermediate_buffer=[{"speaker": "speaker-b", "meta": {"left_context_size": 0}}],
+        seq_token_counts=[2],
+    )
+
+    assert len(model.code2wav.forward_streaming_calls) == 3
+    hit_call = model.code2wav.forward_streaming_calls[2]
+    assert hit_call["prompt_token"].untyped_storage().data_ptr() == prompt_b.untyped_storage().data_ptr()
+    assert hit_call["prompt_feat"].untyped_storage().data_ptr() == prompt_feat_b.untyped_storage().data_ptr()
+    assert hit_call["embedding"].untyped_storage().data_ptr() == embedding_b.untyped_storage().data_ptr()
+    assert set(model._prompt_prefix_cache._cache.keys()) == {"speaker-a", "speaker-b"}
+    assert model.get_prompt_prefix_cache_stats()["hits"] == 1
+
+
+def test_forward_prompt_prefix_cache_lru_eviction():
+    model = _make_code2wav_model()
+    model._prompt_prefix_cache.max_size = 1
+
+    def run(speaker: str, include_embed: bool = True):
+        info = {"speaker": speaker, "meta": {"left_context_size": 0}}
+        if include_embed:
+            info["embed"] = {
+                "speech_token": torch.tensor([[1, 2]], dtype=torch.long),
+                "speech_feat": torch.ones((1, 2, 2), dtype=torch.float32),
+                "embedding": torch.ones((1, 2), dtype=torch.float32),
+            }
+        return model.forward(
+            input_ids=torch.tensor([0, 1], dtype=torch.long),
+            positions=torch.tensor([0, 1], dtype=torch.long),
+            model_intermediate_buffer=[info],
+            seq_token_counts=[2],
+        )
+
+    run("speaker-a")
+    run("speaker-b")
+    run("speaker-a")
+
+    stats = model.get_prompt_prefix_cache_stats()
+    assert stats["misses"] == 3
+    assert stats["evictions"] == 2
+    assert stats["cache_size"] == 1
+
+
+def test_forward_prompt_prefix_cache_does_not_mutate_cached_tensors():
+    model = _make_code2wav_model()
+    prompt_token = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    prompt_feat = torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32)
+    embedding = torch.tensor([[0.5, 0.6]], dtype=torch.float32)
+    expected_token = prompt_token.clone()
+    expected_feat = prompt_feat.clone()
+    expected_embedding = embedding.clone()
+
+    model.forward(
+        input_ids=torch.tensor([0, 1], dtype=torch.long),
+        positions=torch.tensor([0, 1], dtype=torch.long),
+        model_intermediate_buffer=[
+            {
+                "speaker": "speaker-a",
+                "embed": {
+                    "speech_token": prompt_token,
+                    "speech_feat": prompt_feat,
+                    "embedding": embedding,
+                },
+                "meta": {"left_context_size": 0},
+            }
+        ],
+        seq_token_counts=[2],
+    )
+    model.forward(
+        input_ids=torch.tensor([0, 1], dtype=torch.long),
+        positions=torch.tensor([0, 1], dtype=torch.long),
+        model_intermediate_buffer=[{"speaker": "speaker-a", "meta": {"left_context_size": 0}}],
+        seq_token_counts=[2],
+    )
+
+    cached = model._prompt_prefix_cache._cache["speaker-a"]
+    assert torch.equal(cached.prompt_token, expected_token)
+    assert torch.equal(cached.prompt_feat, expected_feat)
+    assert torch.equal(cached.embedding, expected_embedding)
+    assert torch.equal(prompt_token, expected_token)
+    assert torch.equal(prompt_feat, expected_feat)
+    assert torch.equal(embedding, expected_embedding)
+
+
 def test_forward_clears_streaming_cache_on_terminal_chunk():
     model = _make_code2wav_model(
         outputs=[
@@ -558,6 +798,26 @@ def test_sample_tolerates_padded_rows_without_history():
 
     assert out is not None
     assert out.sampled_token_ids.shape == (2, 1)
+
+
+def test_talker_forward_passes_speaker_to_code2wav_payload():
+    model = _make_talker_model()
+    model.embed_input_ids = lambda ids: torch.ones((ids.numel(), 2), dtype=torch.float32)
+    model.model = SimpleNamespace(llm=lambda inputs_embeds, positions: inputs_embeds + positions.reshape(-1, 1))
+
+    out = model.forward(
+        input_ids=torch.tensor([1, 2], dtype=torch.long),
+        positions=torch.tensor([0, 1], dtype=torch.long),
+        speech_token=torch.tensor([[1, 2, 3]], dtype=torch.long),
+        speech_feat=torch.ones((1, 6, 2), dtype=torch.float32),
+        speech_token_len=[torch.tensor([3], dtype=torch.long)],
+        embedding=torch.ones((1, 2), dtype=torch.float32),
+        model_intermediate_buffer=[{"speaker": "bench_voice"}],
+    )
+
+    speakers = out.multimodal_outputs["speaker"]
+    assert isinstance(speakers, list)
+    assert bytes(speakers[0].tolist()).decode("utf-8") == "bench_voice"
 
 
 def test_gpu_ar_model_runner_prefers_model_sampler_when_opted_in():

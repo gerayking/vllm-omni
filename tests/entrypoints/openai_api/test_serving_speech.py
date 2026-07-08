@@ -3181,6 +3181,32 @@ class TestCosyVoice3Serving:
         assert tts_params == {}
         cosyvoice3_server._build_cosyvoice3_prompt.assert_awaited_once()
 
+    def test_build_cosyvoice3_prompt_marks_uploaded_voice_speaker(self, cosyvoice3_server, mocker: MockerFixture):
+        cosyvoice3_server.uploaded_speakers = {
+            "bench_voice": {
+                "name": "bench_voice",
+                "created_at": 1711234567,
+            }
+        }
+        mocker.patch.object(cosyvoice3_server, "_voice_created_at", return_value=1711234567)
+        mocker.patch.object(
+            cosyvoice3_server,
+            "_resolve_ref_audio",
+            mocker.AsyncMock(return_value=([0.0, 0.1, -0.1], 24000)),
+        )
+        request = OpenAICreateSpeechRequest(
+            input="Hello",
+            voice="Bench_Voice",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text="Reference text",
+        )
+
+        prompt = asyncio.run(cosyvoice3_server._build_cosyvoice3_prompt(request, has_inline_ref_audio=False))
+
+        assert prompt["mm_processor_kwargs"]["voice_name"] == "bench_voice"
+        assert prompt["mm_processor_kwargs"]["voice_created_at"] == 1711234567
+        assert prompt["additional_information"]["speaker"] == "bench_voice"
+
 
 # ---- GLM-TTS Serving Tests ----
 
