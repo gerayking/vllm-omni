@@ -13,10 +13,16 @@ import pytest
 from benchmarks.competition.minicpmo_ascend.client import (
     WavAccumulator,
     build_payload,
+    media_url,
     metric_summary,
     percentile,
 )
 from benchmarks.competition.minicpmo_ascend.report import _resource_peaks, _write_manifest
+from benchmarks.competition.minicpmo_ascend.video_mme import (
+    build_official_results,
+    extract_choice,
+    summarize,
+)
 
 
 def _wav_chunk(samples: list[int], sample_rate: int = 24000) -> str:
@@ -83,6 +89,55 @@ def test_payload_and_metrics_keep_modes_and_failures_separate() -> None:
     assert summary["first_text_s"]["p50"] == 2.0
     assert summary["e2e_s"]["mean"] == 3.0
     assert percentile([], 0.95) is None
+
+
+def test_media_url_preserves_explicit_file_uri(tmp_path: Path) -> None:
+    uri = (tmp_path / "large.mp4").as_uri()
+    assert media_url(uri, "video") == uri
+
+
+def test_video_mme_choice_and_summary_match_official_shape() -> None:
+    assert extract_choice("C") == "C"
+    assert extract_choice("Answer: D. Something") == "D"
+    assert extract_choice("I cannot tell") is None
+    items = [
+        {
+            "video_id": "001",
+            "question_id": "001-1",
+            "duration": "short",
+            "domain": "Knowledge",
+            "sub_category": "History",
+            "task_type": "Counting",
+            "question": "Q?",
+            "options": ["A. One", "B. Two", "C. Three", "D. Four"],
+            "gold": "C",
+            "response": "C",
+            "predicted": "C",
+            "correct": True,
+            "success": True,
+        },
+        {
+            "video_id": "001",
+            "question_id": "001-2",
+            "duration": "short",
+            "domain": "Knowledge",
+            "sub_category": "History",
+            "task_type": "Counting",
+            "question": "Q2?",
+            "options": ["A", "B", "C", "D"],
+            "gold": "A",
+            "response": "B",
+            "predicted": "B",
+            "correct": False,
+            "success": True,
+        },
+    ]
+    summary = summarize(items)
+    assert summary["accuracy"] == 0.5
+    assert summary["by_duration"]["short"] == {"correct": 1, "total": 2, "accuracy": 0.5}
+    official = build_official_results(items)
+    assert official[0]["video_id"] == "001"
+    assert [question["response"] for question in official[0]["questions"]] == ["C", "B"]
 
 
 def test_correctness_gate_writes_failure_when_smoke_artifact_is_missing(tmp_path: Path) -> None:

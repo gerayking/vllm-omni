@@ -1029,27 +1029,58 @@ class DailyOmniDataset(BenchmarkDataset):
     ) -> tuple[list[Any], list[Any]]:
         """Port of MiniCPM ``get_video_frame_audio_segments`` (stack_frames=1, 1fps)."""
         import numpy as np
-        from decord import VideoReader, cpu
         from PIL import Image
         from vllm.multimodal.media.audio import load_audio
 
-        vr = VideoReader(str(video_path), ctx=cpu(0))
-        avg_fps = float(vr.get_avg_fps()) or 1.0
-        duration = len(vr) / avg_fps
+        try:
+            from decord import VideoReader, cpu
+
+            vr = VideoReader(str(video_path), ctx=cpu(0))
+            frame_count = len(vr)
+            avg_fps = float(vr.get_avg_fps()) or 1.0
+
+            def read_frames(indices: list[int]) -> Any:
+                return vr.get_batch(indices).asnumpy()
+
+        except ModuleNotFoundError:
+            import cv2
+
+            capture = cv2.VideoCapture(str(video_path))
+            if not capture.isOpened():
+                raise RuntimeError(f"OpenCV could not open Daily-Omni video: {video_path}")
+            frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            avg_fps = float(capture.get(cv2.CAP_PROP_FPS)) or 1.0
+
+            def read_frames(indices: list[int]) -> Any:
+                decoded = []
+                try:
+                    for index in indices:
+                        capture.set(cv2.CAP_PROP_POS_FRAMES, index)
+                        ok, frame = capture.read()
+                        if not ok:
+                            raise RuntimeError(f"OpenCV failed to decode frame {index} from {video_path}")
+                        decoded.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                finally:
+                    capture.release()
+                return np.stack(decoded)
+
+        if frame_count <= 0:
+            raise RuntimeError(f"Daily-Omni video contains no frames: {video_path}")
+        duration = frame_count / avg_fps
         num_seconds = max(1, int(math.ceil(duration)))
         second_timestamps = list(range(num_seconds))
 
         if duration > max_num_frames:
             timestamps = [round(i * 0.1, 1) for i in range(int(duration / 0.1))]
-            frame_idx = [min(int(ts * avg_fps), len(vr) - 1) for ts in timestamps]
+            frame_idx = [min(int(ts * avg_fps), frame_count - 1) for ts in timestamps]
             pick = _uniform_sample_indices(len(frame_idx), max_num_frames)
             frame_idx = [frame_idx[i] for i in pick]
             timestamps = [timestamps[i] for i in pick]
         else:
-            frame_idx = [min(int(i * avg_fps), len(vr) - 1) for i in range(num_seconds)]
+            frame_idx = [min(int(i * avg_fps), frame_count - 1) for i in range(num_seconds)]
             timestamps = second_timestamps
 
-        video = vr.get_batch(frame_idx).asnumpy()
+        video = read_frames(frame_idx)
         frames = [Image.fromarray(v.astype("uint8")).convert("RGB") for v in video]
 
         audio_segments: list[Any] = []
@@ -1093,7 +1124,7 @@ class DailyOmniDataset(BenchmarkDataset):
         """
         if choice is None:
             return ""
-        if isinstance(choice, (list, tuple)):
+        if isinstance(choice, list | tuple):
             lines = [str(x).strip() for x in choice if str(x).strip()]
             return "\n".join(lines)
         if isinstance(choice, dict):

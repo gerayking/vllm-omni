@@ -96,18 +96,71 @@ audio chunk arrival/inter-chunk times, E2E, finish reasons, error details, WAV
 format, chunk hashes, and reconstructed audio. Results are labeled
 `local_proxy`; no unofficial composite score is emitted.
 
+Install the optional public benchmark evaluator dependencies before running the
+three effect checks below:
+
+```bash
+.venv/bin/python -m pip install -r \
+  benchmarks/competition/minicpmo_ascend/requirements-eval.txt
+```
+
 ## 4. Run the Daily-Omni proxy effect check
 
 ```bash
 DAILY_OMNI_QA_JSON=/data/Daily-Omni/qa.json \
-DAILY_OMNI_VIDEO_DIR=/data/Daily-Omni/videos \
+DAILY_OMNI_VIDEO_DIR=/data/Daily-Omni/Videos \
+DAILY_OMNI_INPUT_MODE=all \
+DAILY_OMNI_PACK_MODE=minicpm-interleave \
 bash benchmarks/competition/minicpmo_ascend/run_daily_omni.sh
 ```
 
 This requests text only and disables thinking so A-D answer extraction is
-stable. Replace it with the official effect suite as soon as one is released.
+stable. Start MiniCPM-o with `--interleave-mm-strings` when using the default
+`minicpm-interleave` pack mode. Replace this public benchmark with the exact
+competition subset and protocol when the organizer releases them.
 
-## 5. Capture an NPU profile
+## 5. Run the public Seed-TTS effect check
+
+Use the standard `en/meta.lst` or `zh/meta.lst` split from the public
+`seed-tts-eval` release. Start the server with `ALLOWED_LOCAL_MEDIA_PATH`
+covering the dataset root because reference WAV files are sent as `file://`
+URLs.
+
+```bash
+SEED_TTS_ROOT=/data/seed-tts-eval \
+SEED_TTS_LOCALE=en \
+MODEL=/path/to/MiniCPM-o-4_5 \
+bash benchmarks/competition/minicpmo_ascend/run_seed_tts.sh
+```
+
+Set `WER_EVAL=1` to run the public Seed-TTS ASR/WER evaluator. Its official
+English protocol loads Whisper-large-v3; the Chinese protocol loads
+Paraformer-zh. Keep WavLM SIM and UTMOS results labeled as proxies because
+their public checkpoints are not identical to the organizer's unreleased
+competition evaluator.
+
+## 6. Run the public Video-MME effect check
+
+Download and extract the public Video-MME release, then point the runner at
+the official parquet metadata and MP4 directory. Large local videos are sent
+as `file://` URLs, so start the server with `ALLOWED_LOCAL_MEDIA_PATH` covering
+the dataset root.
+
+```bash
+VIDEO_MME_METADATA=/data/Video-MME/videomme/test-00000-of-00001.parquet \
+VIDEO_MME_VIDEO_DIR=/data/Video-MME/videos \
+MODEL=/path/to/MiniCPM-o-4_5 \
+bash benchmarks/competition/minicpmo_ascend/run_video_mme.sh \
+  --durations short medium long --concurrency 1
+```
+
+Use `--max-videos 1` or `--num-questions 3` for a deterministic smoke run.
+The runner emits raw request records, an accuracy breakdown, and the grouped
+JSON structure documented by Video-MME. It evaluates the public,
+subtitles-free protocol; it is not a substitute for an unreleased competition
+subset or score.
+
+## 7. Capture an NPU profile
 
 Keep profiling separate from score measurements. The profile runner generates
 a temporary deploy config, starts a clean server, warms it outside the capture

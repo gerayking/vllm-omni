@@ -24,7 +24,7 @@ SYSTEM_PROMPT = (
 
 def media_url(value: str | Path, modality: str) -> str:
     raw = str(value)
-    if raw.startswith(("http://", "https://", "data:")):
+    if raw.startswith(("http://", "https://", "file://", "data:")):
         return raw
     path = Path(raw).expanduser().resolve()
     if not path.is_file():
