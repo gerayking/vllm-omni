@@ -1,5 +1,6 @@
 import io
 import os
+import sys
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -13,6 +14,21 @@ import torch
 import torch.nn as nn
 import torchaudio
 import torchaudio.compliance.kaldi as kaldi
+
+try:
+    import flashcosyvoice  # noqa: F401
+except ModuleNotFoundError:
+    from stepaudio2 import flashcosyvoice
+
+    sys.modules["flashcosyvoice"] = flashcosyvoice
+
+try:
+    import cosyvoice2  # noqa: F401
+except ModuleNotFoundError:
+    from stepaudio2 import cosyvoice2
+
+    sys.modules["cosyvoice2"] = cosyvoice2
+
 from flashcosyvoice.modules.hifigan import HiFTGenerator
 from flashcosyvoice.utils.audio import mel_spectrogram
 from hyperpyyaml import load_hyperpyyaml

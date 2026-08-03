@@ -124,15 +124,27 @@ class OmniEngineCoreRequest(EngineCoreRequest):
         )
 
 
-class OmniEngineCoreOutput(EngineCoreOutput):
-    # Dedicated channel for multimodal outputs (image/audio/latent).
-    # pooling_output is inherited from EngineCoreOutput as torch.Tensor | None
-    # and retains its original vLLM semantics for pooling/embedding tasks.
-    multimodal_output: dict[str, torch.Tensor] | None = None
-    # Finished flag for streaming input segment
-    is_segment_finished: bool | None = False
-    # Streaming update prompt length
-    new_prompt_len_snapshot: int | None = None
+if "ec_transfer_params" in getattr(EngineCoreOutput, "__struct_fields__", ()):
+
+    class OmniEngineCoreOutput(EngineCoreOutput):
+        # Dedicated channel for multimodal outputs (image/audio/latent).
+        # pooling_output is inherited from EngineCoreOutput as torch.Tensor | None
+        # and retains its original vLLM semantics for pooling/embedding tasks.
+        multimodal_output: dict[str, torch.Tensor] | None = None
+        # Finished flag for streaming input segment
+        is_segment_finished: bool | None = False
+        # Streaming update prompt length
+        new_prompt_len_snapshot: int | None = None
+
+else:
+
+    class OmniEngineCoreOutput(EngineCoreOutput):
+        # vLLM added this transfer channel after the competition image's pinned
+        # revision. Keep the wire shape available on both sides of that change.
+        ec_transfer_params: dict[str, Any] | None = None
+        multimodal_output: dict[str, torch.Tensor] | None = None
+        is_segment_finished: bool | None = False
+        new_prompt_len_snapshot: int | None = None
 
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):

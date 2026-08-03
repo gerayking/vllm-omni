@@ -1,0 +1,73 @@
+schema_version: 2
+snapshot_date: "2026-08-03"
+competition:
+  name: MiniCPM & Ascend Inference Optimization and Application Innovation Challenge
+  track: high-performance-inference
+  sub_track: vllm-omni
+  rules_url: https://ascend.openbmb.cn/competition
+  rules_retrieved_at: "2026-08-03T03:00:00Z"
+  submission_deadline_cst: "2026-08-17T12:00:00+08:00"
+  daily_submission_limit: 3
+  starter_kit:
+    url: https://oiac.openbmb.org/toolkit/oiac-toolkit-v1.0.tar.gz
+    version: v1.0-advertised-unavailable
+    sha256: UNRESOLVED
+    retrieval_status: dns-unresolved-on-2026-08-03
+  performance_metrics: [per_chunk_rtf, ttft, ttfp]
+  scoring_formula: UNRESOLVED_NORMALIZATION_AND_WEIGHTS
+  request_schema: UNRESOLVED
+  effect_benchmarks: [Daily-Omni, TTS-Seed, Video-MME]
+  effect_thresholds:
+    maximum_accuracy_drop_percentage_points: 2
+    comparison_baseline: official-vllm-omni-sub-track-baseline
+  demo_gate: official-vllm-omni-demo-required
+  concurrency_levels: UNRESOLVED
+  timeouts: UNRESOLVED
+  package_limits: UNRESOLVED
+
+official_environment:
+  npu_model: Ascend 910C
+  physical_card_count: 1
+  topology: one-physical-card-two-logical-chips
+  cpu_limit: UNRESOLVED
+  ram_limit: UNRESOLVED
+  network_policy: UNRESOLVED
+  image: quay.io/ascend/vllm-omni:v0.25.0-a3
+  driver: UNRESOLVED
+  firmware: UNRESOLVED
+  cann: UNRESOLVED
+  python: "3.12 (published vLLM-Omni NPU requirement; verify in image)"
+  pytorch: UNRESOLVED
+  torch_npu: UNRESOLVED
+  vllm: UNRESOLVED
+  vllm_ascend: UNRESOLVED
+  vllm_omni: "0.25.0 image release"
+
+model:
+  source: openbmb/MiniCPM-o-4_5
+  revision: UNRESOLVED
+  sha256_manifest: UNRESOLVED
+  packaging_rules: UNRESOLVED
+
+local_proxy:
+  hardware:
+    model: Ascend 910C
+    physical_card_count: 1
+    chips_per_card: 2
+    logical_device_ids: [0, 1]
+    hbm_per_chip_gib: 64
+    aggregate_hbm_gib: 128
+    evidence_command: npu-smi info -l
+  deploy_config: vllm_omni/deploy/minicpmo_4_5_ascend_910c_1card.yaml
+  output_sample_rate_hz: 24000
+  seed: 42
+  thinker_max_tokens: 256
+  talker_max_tokens: 256
+  warmup_requests: 2
+  benchmark_concurrency: [1, 2, 4]
+  benchmark_requests_per_configuration: 20
+  stability_mode: text_audio
+  stability_concurrency: 4
+  stability_requests: 100
+  percentile_statistics: [p50, p95, p99]
+  note: Local proxy values are not official scoring definitions.

@@ -627,7 +627,7 @@ class Orchestrator:
                     self._shutdown_event.wait(),
                     timeout=self._duplex_reaper_interval_s,
                 )
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 plane = self.duplex_control_plane
                 if plane is not None:
                     try:
@@ -1528,7 +1528,7 @@ class Orchestrator:
                 value = value.detach().cpu().reshape(-1).tolist()
             except Exception:
                 return []
-        if not isinstance(value, (list, tuple)):
+        if not isinstance(value, list | tuple):
             return []
         out: list[int] = []
         for item in value:

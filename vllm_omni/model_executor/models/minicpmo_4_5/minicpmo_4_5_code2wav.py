@@ -20,6 +20,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
 
 from .batched_token2wav import (
     BatchedToken2Wav,
@@ -30,6 +31,30 @@ from .batched_token2wav import (
 logger = init_logger(__name__)
 
 
+def _token2wav_dtype(extra: Mapping[str, Any]) -> str:
+    configured = extra.get("token2wav_dtype")
+    legacy_float16 = bool(extra.get("token2wav_float16", False))
+    if configured is None:
+        return "float16" if legacy_float16 else "float32"
+    aliases = {
+        "fp32": "float32",
+        "float32": "float32",
+        "fp16": "float16",
+        "float16": "float16",
+        "bf16": "bfloat16",
+        "bfloat16": "bfloat16",
+    }
+    normalized = aliases.get(str(configured).lower())
+    if normalized is None:
+        raise ValueError(
+            "MiniCPM-o Code2Wav token2wav_dtype must be fp32, fp16, or "
+            f"bf16, got {configured!r}"
+        )
+    if legacy_float16 and normalized != "float16":
+        raise ValueError("token2wav_float16=True conflicts with token2wav_dtype")
+    return normalized
+
+
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
     payload = {"reason": reason, **details}
     return RuntimeError(f"MiniCPMO45Code2WavBatchError {json.dumps(payload, sort_keys=True)}")
@@ -38,7 +63,7 @@ def _batch_error(reason: str, **details: Any) -> RuntimeError:
 def _scalar(value: Any, default: Any = None) -> Any:
     if isinstance(value, torch.Tensor):
         return value.reshape(-1)[0].item() if value.numel() else default
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
         return _scalar(value[0], default) if value else default
     return default if value is None else value
 
@@ -46,7 +71,7 @@ def _scalar(value: Any, default: Any = None) -> Any:
 def _codec_tensor(value: Any, fallback: torch.Tensor) -> torch.Tensor:
     if isinstance(value, torch.Tensor):
         return value.reshape(-1).to(device=fallback.device, dtype=torch.long)
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
         return torch.as_tensor(value, device=fallback.device, dtype=torch.long).reshape(-1)
     return fallback.reshape(-1).to(dtype=torch.long)
 
@@ -305,7 +330,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         flat = input_ids.reshape(-1)
         if counts is None:
             return [flat]
-        if not isinstance(counts, Sequence) or isinstance(counts, (str, bytes, bytearray)):
+        if not isinstance(counts, Sequence) or isinstance(counts, str | bytes | bytearray):
             raise _batch_error("invalid_seq_token_counts", value_type=type(counts).__name__)
         normalized = [int(value) for value in counts]
         if any(value < 0 for value in normalized):
@@ -740,8 +765,6 @@ class MiniCPMO45Code2Wav(nn.Module):
         if self.backend is not None:
             return
 
-        from vllm_omni.platforms import current_omni_platform
-
         if current_omni_platform.is_npu():
             # NPU/Ascend: the external `stepaudio2` package hard-codes `.cuda()`,
             # so use the in-tree NPU-aware adapter instead. It delegates to
@@ -761,18 +784,25 @@ class MiniCPMO45Code2Wav(nn.Module):
         token2wav_path = model_root / "assets" / "token2wav"
         if not token2wav_path.is_dir():
             raise FileNotFoundError(f"MiniCPM-o Code2Wav assets not found: {token2wav_path}")
-        use_float16 = bool(extra.get("token2wav_float16", False))
+        token2wav_dtype = _token2wav_dtype(extra)
+        use_float16 = token2wav_dtype == "float16"
+        is_npu = current_omni_platform.is_npu()
+        if token2wav_dtype == "bfloat16" and not is_npu:
+            raise ValueError("the external GPU Token2Wav backend does not support token2wav_dtype=bf16")
         previous_dtype = torch.get_default_dtype()
         try:
             # vLLM constructs bf16 models under a bf16 default-dtype context.
             # Token2wav contains fp32-only S3Tokenizer/HiFT modules, so build
             # its independent assets in their native precision.
             torch.set_default_dtype(torch.float32)
-            token2wav = Token2wav(
-                str(token2wav_path),
-                float16=use_float16,
-                n_timesteps=int(extra.get("token2wav_n_timesteps", 10)),
-            )
+            kwargs: dict[str, Any] = {
+                "float16": use_float16,
+                "n_timesteps": int(extra.get("token2wav_n_timesteps", 10)),
+            }
+            if is_npu:
+                kwargs["device"] = current_omni_platform.get_torch_device()
+                kwargs["dtype"] = token2wav_dtype
+            token2wav = Token2wav(str(token2wav_path), **kwargs)
         finally:
             torch.set_default_dtype(previous_dtype)
         self.backend = BatchedToken2Wav(token2wav)
