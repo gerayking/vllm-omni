@@ -47,24 +47,42 @@ HTTP 200 from `/health`, and served all five deterministic smoke cases:
 All generated audio passed the suite's WAV structure, non-empty PCM, and
 stream-completion checks.
 
-## Reduced proxy benchmark
+## Expanded proxy benchmark
 
-The submission tooling was exercised with two measured requests per point and
-one warmup. These small samples verify the path and artifact schema; they are
-not statistically meaningful competition measurements.
+The low-sample path check was superseded by an expanded run pinned to commit
+`69d29b78feeedd08ef3dd66986a05895ca7b0323`. Each primary configuration used
+three warmups followed by 30 measured requests. The matrix covered text and
+text-plus-audio output at concurrency 1, 2, and 4, for 180 measured requests.
 
-| Mode | Concurrency | OK/failed | First text p50 (s) | First audio p50 (s) | E2E p50 (s) |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| text | 1 | 2/0 | 0.088 | - | 1.517 |
-| text | 2 | 2/0 | 7.468 | - | 10.571 |
-| text plus audio | 1 | 2/0 | 0.783 | 1.691 | 2.234 |
-| text plus audio | 2 | 2/0 | 0.817 | 2.500 | 3.450 |
+| Mode | C | OK/failed | First text p50/p95 (s) | First audio p50/p95 (s) | E2E p50/p95 (s) | Req/s | Audio s/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| text | 1 | 30/0 | 0.086/0.091 | -/- | 1.521/1.532 | 0.658 | - |
+| text | 2 | 30/0 | 0.104/0.113 | -/- | 1.564/1.878 | 1.209 | - |
+| text | 4 | 30/0 | 0.133/0.177 | -/- | 1.623/1.699 | 2.249 | - |
+| text plus audio | 1 | 30/0 | 0.772/0.778 | 1.702/1.714 | 3.834/3.924 | 0.257 | 1.914 |
+| text plus audio | 2 | 30/0 | 0.810/0.829 | 2.589/2.740 | 6.404/6.456 | 0.311 | 2.310 |
+| text plus audio | 4 | 30/0 | 0.824/0.875 | 2.774/3.320 | 8.287/9.684 | 0.468 | 3.410 |
 
-A separate text-plus-audio stability point at concurrency 1 passed 2/2
-requests with 0 failures. The machine-readable correctness gate passed with
-an empty failure list. Raw local artifacts were written to
-`artifacts/minicpmo_ascend/baseline-20260803-real/` and are intentionally not
-committed because they include generated media and machine-specific paths.
+A separate text-plus-audio concurrency-4 stability run used three warmups and
+200 measured requests. It completed 200/200 requests with no failures in
+471.806 seconds: first text p50/p95 was 0.788/1.176 seconds, first audio was
+2.962/3.712 seconds, E2E was 9.311/11.271 seconds, request throughput was 0.424
+requests/s, and generated-audio throughput was 3.113 audio seconds/s.
+
+Across the primary and stability runs, all 380 measured requests succeeded.
+All 290 measured audio responses were complete and non-empty, and no adjacent
+duplicate audio chunks were detected. The machine-readable correctness gate
+passed with an empty failure list. Peak aggregate HBM reported by the resource
+sampler was 108,899 MiB during stability.
+
+Raw local artifacts are under
+`artifacts/minicpmo_ascend/baseline-69d29b78-expanded/` and are intentionally
+ignored because they contain generated media and machine-specific paths. Key
+SHA-256 values:
+
+- Primary benchmark JSON: `ca45c3cc36a12146952a0891c90682c8a9e3852230695623361c0bee8b348997`
+- Stability benchmark JSON: `9277295da5a9b88ddf5935482aefa20a65e08ba993836c4b28aa23c45eca2e65`
+- Generated baseline report: `219f6aea4f5b0de57ba4f31da86a366dbd95443061dfb564e02a3ae45cbe27c3`
 
 ## Regression validation
 
