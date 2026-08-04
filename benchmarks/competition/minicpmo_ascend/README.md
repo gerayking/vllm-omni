@@ -104,7 +104,47 @@ three effect checks below:
   benchmarks/competition/minicpmo_ascend/requirements-eval.txt
 ```
 
-## 4. Run the Daily-Omni proxy effect check
+## 4. Build and run the fixed public proxy benchmark
+
+Build the versioned four-workload sample set with seed 42. The default 400
+samples contain 100 Daily-Omni questions, 100 English Seed-TTS rows, 100
+Chinese Seed-TTS rows, and 100 Video-MME questions. Daily-Omni is balanced by
+video duration before category, Seed-TTS is balanced by target-text length
+quartile, and Video-MME is balanced by duration before domain. Media inputs are
+unique within each workload where the public data permits it.
+
+```bash
+/workspace/minicpmo-npu-venv/bin/python -m \
+  benchmarks.competition.minicpmo_ascend.build_public_benchmark \
+  --daily-qa /data/Daily-Omni/qa.json \
+  --daily-video-dir /data/Daily-Omni/Videos \
+  --seed-tts-root /data/seed-tts-eval \
+  --video-mme-metadata /data/Video-MME/videomme/test-00000-of-00001.parquet \
+  --video-mme-video-dir /data/Video-MME/extracted/data \
+  --output-dir /data/public-proxy-benchmark-v1 \
+  --seed 42
+```
+
+Start the server with local media access covering `/data` and MiniCPM
+interleaved AV strings enabled, then run all four workloads at concurrency 1:
+
+```bash
+SAMPLE_ROOT=/data/public-proxy-benchmark-v1 \
+DATA_ROOT=/data \
+MODEL=/path/to/MiniCPM-o-4_5 \
+BENCH_BIN=/path/to/vllm-omni \
+PYTHON=/path/to/python \
+SOURCE_REVISION=<tested-source-revision> \
+bash benchmarks/competition/minicpmo_ascend/run_public_proxy_benchmark.sh
+```
+
+This suite is a deterministic public-data proxy, not an official competition
+benchmark or score. Keep the generated `manifest.json`, `summary.json`, and
+`report.md` with every result set. The 100-row Seed-TTS passes measure
+generation success, streaming continuity, TTFP, E2E, RTF, and throughput; run
+the separate ASR evaluator when WER is required.
+
+## 5. Run the Daily-Omni proxy effect check
 
 ```bash
 DAILY_OMNI_QA_JSON=/data/Daily-Omni/qa.json \
@@ -119,7 +159,7 @@ stable. Start MiniCPM-o with `--interleave-mm-strings` when using the default
 `minicpm-interleave` pack mode. Replace this public benchmark with the exact
 competition subset and protocol when the organizer releases them.
 
-## 5. Run the public Seed-TTS effect check
+## 6. Run the public Seed-TTS effect check
 
 Use the standard `en/meta.lst` or `zh/meta.lst` split from the public
 `seed-tts-eval` release. Start the server with `ALLOWED_LOCAL_MEDIA_PATH`
@@ -139,7 +179,7 @@ Paraformer-zh. Keep WavLM SIM and UTMOS results labeled as proxies because
 their public checkpoints are not identical to the organizer's unreleased
 competition evaluator.
 
-## 6. Run the public Video-MME effect check
+## 7. Run the public Video-MME effect check
 
 Download and extract the public Video-MME release, then point the runner at
 the official parquet metadata and MP4 directory. Large local videos are sent
@@ -160,7 +200,7 @@ JSON structure documented by Video-MME. It evaluates the public,
 subtitles-free protocol; it is not a substitute for an unreleased competition
 subset or score.
 
-## 7. Capture an NPU profile
+## 8. Capture an NPU profile
 
 Keep profiling separate from score measurements. The profile runner generates
 a temporary deploy config, starts a clean server, warms it outside the capture

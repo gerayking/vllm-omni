@@ -44,6 +44,7 @@ fi
 if [[ -n "${DAILY_OMNI_VIDEO_DIR:-}" ]]; then
     command+=(--daily-omni-video-dir "${DAILY_OMNI_VIDEO_DIR}")
 fi
+command+=("$@")
 
 printf '%q ' "${command[@]}" | tee "${OUTPUT_DIR}/command.txt"
 printf '\n' | tee -a "${OUTPUT_DIR}/command.txt"

@@ -43,6 +43,7 @@ command=(
 if [[ "${WER_EVAL}" == "1" ]]; then
     command+=(--seed-tts-wer-eval --seed-tts-wer-save-items)
 fi
+command+=("$@")
 
 printf '%q ' "${command[@]}" | tee "${OUTPUT_DIR}/command.txt"
 printf '\n' | tee -a "${OUTPUT_DIR}/command.txt"
