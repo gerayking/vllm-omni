@@ -532,9 +532,7 @@ def test_conditional_cfm_cuda_graph_cpu_fallback_updates_stats(monkeypatch):
     spks = torch.ones(1, 2)
     cond = torch.zeros_like(x)
 
-    out = cfm.solve_euler(
-        x, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond
-    )
+    out = cfm.solve_euler(x, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond)
 
     assert torch.equal(out, x)
     stats = cfm.get_cuda_graph_stats()
@@ -630,27 +628,25 @@ def test_conditional_cfm_cuda_graph_replays_match_eager(monkeypatch):
         def forward(self, x, mask, mu, t, spks, cond):
             spk_term = spks.sum(dim=1, keepdim=True).unsqueeze(-1)
             t_term = t.view(-1, 1, 1)
-            return (
-                x * 0.125
-                + mu * 0.25
-                + cond * 0.5
-                + spk_term * 0.01
-                + t_term * 0.05
-            ) * mask
+            return (x * 0.125 + mu * 0.25 + cond * 0.5 + spk_term * 0.01 + t_term * 0.05) * mask
 
     def build_cfm():
-        return ConditionalCFM(
-            in_channels=2,
-            cfm_params=SimpleNamespace(
-                solver="euler",
-                t_scheduler="linear",
-                training_cfg_rate=0.0,
-                inference_cfg_rate=0.0,
-            ),
-            n_spks=1,
-            spk_emb_dim=2,
-            estimator=TinyEstimator().cuda().eval(),
-        ).cuda().eval()
+        return (
+            ConditionalCFM(
+                in_channels=2,
+                cfm_params=SimpleNamespace(
+                    solver="euler",
+                    t_scheduler="linear",
+                    training_cfg_rate=0.0,
+                    inference_cfg_rate=0.0,
+                ),
+                n_spks=1,
+                spk_emb_dim=2,
+                estimator=TinyEstimator().cuda().eval(),
+            )
+            .cuda()
+            .eval()
+        )
 
     device = torch.device("cuda")
     x = torch.randn(2, 2, 4, device=device)
@@ -662,19 +658,13 @@ def test_conditional_cfm_cuda_graph_replays_match_eager(monkeypatch):
 
     monkeypatch.delenv("COSYVOICE3_CFM_CUDA_GRAPH", raising=False)
     eager = build_cfm()
-    eager_out = eager.solve_euler(
-        x.clone(), t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond
-    )
+    eager_out = eager.solve_euler(x.clone(), t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond)
 
     monkeypatch.setenv("COSYVOICE3_CFM_CUDA_GRAPH", "1")
     graph = build_cfm()
-    graph_out = graph.solve_euler(
-        x.clone(), t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond
-    )
-    graph_out_2 = graph.solve_euler(
-        x.clone(), t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond
-    )
-    torch.cuda.synchronize()
+    graph_out = graph.solve_euler(x.clone(), t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond)
+    graph_out_2 = graph.solve_euler(x.clone(), t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond)
+    torch.accelerator.synchronize()
 
     assert torch.allclose(graph_out, eager_out)
     assert torch.allclose(graph_out_2, eager_out)

@@ -22,10 +22,14 @@ logger = init_logger(__name__)
 
 
 def _cosyvoice3_cfm_cuda_graph_enabled() -> bool:
-    value = os.environ.get(
-        "COSYVOICE3_CFM_CUDA_GRAPH",
-        os.environ.get("COSYVOICE3_CFM_CUDAGRAPH", "0"),
-    ).strip().lower()
+    value = (
+        os.environ.get(
+            "COSYVOICE3_CFM_CUDA_GRAPH",
+            os.environ.get("COSYVOICE3_CFM_CUDAGRAPH", "0"),
+        )
+        .strip()
+        .lower()
+    )
     return value in ("1", "true", "yes", "on")
 
 
@@ -35,8 +39,7 @@ def _cosyvoice3_cfm_cuda_graph_max_graphs() -> int:
         return max(1, int(value))
     except ValueError:
         logger.warning(
-            "CosyVoice3 CFM CUDA Graph: unsupported "
-            "COSYVOICE3_CFM_CUDA_GRAPH_MAX_GRAPHS=%r; using 4",
+            "CosyVoice3 CFM CUDA Graph: unsupported COSYVOICE3_CFM_CUDA_GRAPH_MAX_GRAPHS=%r; using 4",
             value,
         )
         return 4
@@ -137,9 +140,7 @@ class CUDAGraphCFMEulerRunner:
             entry.static_cond.copy_(cond)
             reason = "hit"
 
-        with torch.profiler.record_function(
-            f"cosyvoice3_cfm_cudagraph_replay_b{x.size(0)}_t{x.size(2)}"
-        ):
+        with torch.profiler.record_function(f"cosyvoice3_cfm_cudagraph_replay_b{x.size(0)}_t{x.size(2)}"):
             entry.graph.replay()
         self._stats["replays"] += 1
         self.last_call_info = {
@@ -158,9 +159,7 @@ class CUDAGraphCFMEulerRunner:
             "shape": tuple(x.shape),
             "cache_size": len(self._cache),
         }
-        with torch.profiler.record_function(
-            f"cosyvoice3_cfm_cudagraph_fallback_b{x.size(0)}_t{x.size(2)}"
-        ):
+        with torch.profiler.record_function(f"cosyvoice3_cfm_cudagraph_fallback_b{x.size(0)}_t{x.size(2)}"):
             pass
 
     def _ineligible_reason(
@@ -250,9 +249,7 @@ class CUDAGraphCFMEulerRunner:
                 device=x.device,
                 dtype=estimator_dtype,
             ),
-            static_t_in=torch.zeros(
-                (cfg_batch,), device=x.device, dtype=estimator_dtype
-            ),
+            static_t_in=torch.zeros((cfg_batch,), device=x.device, dtype=estimator_dtype),
             static_spks_in=torch.zeros(
                 (cfg_batch, spks.size(1)),
                 device=x.device,
@@ -271,18 +268,13 @@ class CUDAGraphCFMEulerRunner:
             torch.accelerator.synchronize(x.device)
 
             graph = torch.cuda.CUDAGraph()
-            with torch.profiler.record_function(
-                f"cosyvoice3_cfm_cudagraph_capture_b{batch}_t{timesteps}"
-            ):
-                with torch.no_grad(), torch.cuda.graph(
-                    graph, pool=current_platform.get_global_graph_pool()
-                ):
+            with torch.profiler.record_function(f"cosyvoice3_cfm_cudagraph_capture_b{batch}_t{timesteps}"):
+                with torch.no_grad(), torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
                     entry.static_out = self._run_static(cfm, entry)
             entry.graph = graph
         except Exception:
             logger.warning(
-                "Disabling CosyVoice3 CFM CUDA Graph after capture failure "
-                "for shape=%s",
+                "Disabling CosyVoice3 CFM CUDA Graph after capture failure for shape=%s",
                 tuple(x.shape),
                 exc_info=True,
             )
@@ -292,9 +284,7 @@ class CUDAGraphCFMEulerRunner:
         self._stats["captures"] += 1
         return entry
 
-    def _run_static(
-        self, cfm: "ConditionalCFM", entry: _CFMEulerGraphEntry
-    ) -> torch.Tensor:
+    def _run_static(self, cfm: "ConditionalCFM", entry: _CFMEulerGraphEntry) -> torch.Tensor:
         batch = entry.static_x.size(0)
         x = entry.static_x
         t_span = entry.static_t_span
@@ -319,13 +309,8 @@ class CUDAGraphCFMEulerRunner:
                 entry.static_spks_in,
                 entry.static_cond_in,
             )
-            dphi_dt, cfg_dphi_dt = torch.split(
-                dphi_dt, [batch, batch], dim=0
-            )
-            dphi_dt = (
-                (1.0 + cfm.inference_cfg_rate) * dphi_dt
-                - cfm.inference_cfg_rate * cfg_dphi_dt
-            )
+            dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [batch, batch], dim=0)
+            dphi_dt = (1.0 + cfm.inference_cfg_rate) * dphi_dt - cfm.inference_cfg_rate * cfg_dphi_dt
             x = x + dt * dphi_dt
         return x
 
@@ -467,9 +452,7 @@ class ConditionalCFM(BASECFM):
                 dtype=estimator_dtype,
             )
             t_in = torch.zeros([estimator_batch], device=x.device, dtype=estimator_dtype)
-            spks_in = torch.zeros(
-                [estimator_batch, spk_dim], device=x.device, dtype=estimator_dtype
-            )
+            spks_in = torch.zeros([estimator_batch, spk_dim], device=x.device, dtype=estimator_dtype)
             cond_in = torch.zeros(
                 [estimator_batch, channels, x.size(2)],
                 device=x.device,
