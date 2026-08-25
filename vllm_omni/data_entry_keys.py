@@ -92,6 +92,7 @@ class OmniPayloadMeta(TypedDict, total=False):
     ref_context_request_id: str
     ref_context_included: bool
     talker_prefill_offset: int
+    resumable: bool
     omni_final_stage_id: int
     # Per-request audio seed. Stages that draw their own noise (flow-matching
     # / diffusion decoders) need the producing stage's seed to stay
@@ -195,6 +196,7 @@ class MetaStruct(_StructBase):
     ref_context_request_id: str | None = None
     ref_context_included: bool | None = None
     talker_prefill_offset: int | None = None
+    resumable: bool | None = None
     codec_chunk_frames: int | None = None
     codec_left_context_frames: int | None = None
     code_flat_numel: int | None = None

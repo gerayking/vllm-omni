@@ -35,6 +35,10 @@ class TestOmniPayloadStruct:
         s = to_struct(d)
         assert s.meta.left_context_size == 25
 
+    def test_to_struct_accepts_resumable_meta_flag(self):
+        s = to_struct({"meta": {"resumable": True}})
+        assert s.meta.resumable is True
+
     def test_to_struct_rejects_legacy_flat_top_level(self):
         with pytest.raises(msgspec.ValidationError, match="unknown field"):
             to_struct({"code_predictor_codes": torch.zeros(3, 8)})

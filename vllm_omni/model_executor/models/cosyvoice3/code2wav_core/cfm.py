@@ -3,17 +3,331 @@
 # Adopted from https://github.com/FunAudioLLM/CosyVoice/tree/main/cosyvoice/flow
 """Conditional Flow Matching (CFM) classes for audio generation."""
 
+import os
 from abc import ABC
+from collections import OrderedDict
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig
 from torch.nn import functional as F
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 
 from vllm_omni.model_executor.models.cosyvoice3.utils import make_pad_mask
 
 logger = init_logger(__name__)
+
+
+def _cosyvoice3_cfm_cuda_graph_enabled() -> bool:
+    value = os.environ.get(
+        "COSYVOICE3_CFM_CUDA_GRAPH",
+        os.environ.get("COSYVOICE3_CFM_CUDAGRAPH", "0"),
+    ).strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
+def _cosyvoice3_cfm_cuda_graph_max_graphs() -> int:
+    value = os.environ.get("COSYVOICE3_CFM_CUDA_GRAPH_MAX_GRAPHS", "4")
+    try:
+        return max(1, int(value))
+    except ValueError:
+        logger.warning(
+            "CosyVoice3 CFM CUDA Graph: unsupported "
+            "COSYVOICE3_CFM_CUDA_GRAPH_MAX_GRAPHS=%r; using 4",
+            value,
+        )
+        return 4
+
+
+@dataclass
+class _CFMEulerGraphEntry:
+    graph: Any
+    static_x: torch.Tensor
+    static_t_span: torch.Tensor
+    static_mu: torch.Tensor
+    static_mask: torch.Tensor
+    static_spks: torch.Tensor
+    static_cond: torch.Tensor
+    static_x_in: torch.Tensor
+    static_mask_in: torch.Tensor
+    static_mu_in: torch.Tensor
+    static_t_in: torch.Tensor
+    static_spks_in: torch.Tensor
+    static_cond_in: torch.Tensor
+    static_out: torch.Tensor
+
+
+class CUDAGraphCFMEulerRunner:
+    """Capture and replay the complete CosyVoice3 CFM Euler loop per shape."""
+
+    def __init__(self, *, enabled: bool, max_graphs: int = 4) -> None:
+        self.enabled = bool(enabled)
+        self.max_graphs = max(1, int(max_graphs))
+        self._cache: OrderedDict[tuple[object, ...], _CFMEulerGraphEntry] = OrderedDict()
+        self._stats = {
+            "calls": 0,
+            "captures": 0,
+            "replays": 0,
+            "fallbacks": 0,
+            "failures": 0,
+            "shape_misses": 0,
+            "cache_full_fallbacks": 0,
+        }
+        self.last_call_info: dict[str, object] = {}
+
+    def stats(self) -> dict[str, int | float]:
+        stats = dict(self._stats)
+        stats["cache_size"] = len(self._cache)
+        stats["unique_graphs"] = len(self._cache)
+        stats["total_euler_calls"] = stats["calls"]
+        calls = int(stats["calls"])
+        stats["replay_hit_rate"] = float(stats["replays"] / calls) if calls else 0.0
+        return stats
+
+    def try_replay(
+        self,
+        cfm: "ConditionalCFM",
+        *,
+        x: torch.Tensor,
+        t_span: torch.Tensor,
+        mu: torch.Tensor,
+        mask: torch.Tensor,
+        spks: torch.Tensor | None,
+        cond: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        self._stats["calls"] += 1
+        ineligible_reason = self._ineligible_reason(cfm, x=x, spks=spks, cond=cond)
+        if ineligible_reason is not None:
+            self._record_fallback(ineligible_reason, x)
+            return None
+
+        assert spks is not None and cond is not None
+        key = self._key(cfm, x=x, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond)
+        entry = self._cache.get(key)
+        if entry is None:
+            self._stats["shape_misses"] += 1
+            if len(self._cache) >= self.max_graphs:
+                self._stats["cache_full_fallbacks"] += 1
+                self._record_fallback("cache_full", x)
+                return None
+            entry = self._capture(
+                cfm,
+                x=x,
+                t_span=t_span,
+                mu=mu,
+                mask=mask,
+                spks=spks,
+                cond=cond,
+            )
+            if entry is None:
+                self._record_fallback("capture_failed", x)
+                return None
+            self._cache[key] = entry
+            reason = "capture"
+        else:
+            self._cache.move_to_end(key)
+            entry.static_x.copy_(x)
+            entry.static_t_span.copy_(t_span)
+            entry.static_mu.copy_(mu)
+            entry.static_mask.copy_(mask)
+            entry.static_spks.copy_(spks)
+            entry.static_cond.copy_(cond)
+            reason = "hit"
+
+        with torch.profiler.record_function(
+            f"cosyvoice3_cfm_cudagraph_replay_b{x.size(0)}_t{x.size(2)}"
+        ):
+            entry.graph.replay()
+        self._stats["replays"] += 1
+        self.last_call_info = {
+            "mode": "graph",
+            "reason": reason,
+            "shape": tuple(x.shape),
+            "cache_size": len(self._cache),
+        }
+        return entry.static_out.clone()
+
+    def _record_fallback(self, reason: str, x: torch.Tensor) -> None:
+        self._stats["fallbacks"] += 1
+        self.last_call_info = {
+            "mode": "eager",
+            "reason": reason,
+            "shape": tuple(x.shape),
+            "cache_size": len(self._cache),
+        }
+        with torch.profiler.record_function(
+            f"cosyvoice3_cfm_cudagraph_fallback_b{x.size(0)}_t{x.size(2)}"
+        ):
+            pass
+
+    def _ineligible_reason(
+        self,
+        cfm: "ConditionalCFM",
+        *,
+        x: torch.Tensor,
+        spks: torch.Tensor | None,
+        cond: torch.Tensor | None,
+    ) -> str | None:
+        if not self.enabled:
+            return "disabled"
+        if x.device.type != "cuda":
+            return "non_cuda"
+        if spks is None or cond is None:
+            return "missing_conditioning"
+        if torch.cuda.is_current_stream_capturing():
+            return "nested_capture"
+        if not isinstance(cfm.estimator, torch.nn.Module):
+            return "non_torch_estimator"
+        return None
+
+    def _key(
+        self,
+        cfm: "ConditionalCFM",
+        *,
+        x: torch.Tensor,
+        t_span: torch.Tensor,
+        mu: torch.Tensor,
+        mask: torch.Tensor,
+        spks: torch.Tensor,
+        cond: torch.Tensor,
+    ) -> tuple[object, ...]:
+        return (
+            x.device.type,
+            x.device.index,
+            tuple(x.shape),
+            x.dtype,
+            tuple(t_span.shape),
+            t_span.dtype,
+            tuple(mu.shape),
+            mu.dtype,
+            tuple(mask.shape),
+            mask.dtype,
+            tuple(spks.shape),
+            spks.dtype,
+            tuple(cond.shape),
+            cond.dtype,
+            cfm.t_scheduler,
+            float(cfm.inference_cfg_rate),
+        )
+
+    def _capture(
+        self,
+        cfm: "ConditionalCFM",
+        *,
+        x: torch.Tensor,
+        t_span: torch.Tensor,
+        mu: torch.Tensor,
+        mask: torch.Tensor,
+        spks: torch.Tensor,
+        cond: torch.Tensor,
+    ) -> _CFMEulerGraphEntry | None:
+        batch, channels, timesteps = x.shape
+        cfg_batch = 2 * batch
+        estimator_dtype = spks.dtype
+        entry = _CFMEulerGraphEntry(
+            graph=None,
+            static_x=x.contiguous().clone(),
+            static_t_span=t_span.contiguous().clone(),
+            static_mu=mu.contiguous().clone(),
+            static_mask=mask.contiguous().clone(),
+            static_spks=spks.contiguous().clone(),
+            static_cond=cond.contiguous().clone(),
+            static_x_in=torch.zeros(
+                (cfg_batch, channels, timesteps),
+                device=x.device,
+                dtype=estimator_dtype,
+            ),
+            static_mask_in=torch.zeros(
+                (cfg_batch, 1, timesteps),
+                device=x.device,
+                dtype=estimator_dtype,
+            ),
+            static_mu_in=torch.zeros(
+                (cfg_batch, channels, timesteps),
+                device=x.device,
+                dtype=estimator_dtype,
+            ),
+            static_t_in=torch.zeros(
+                (cfg_batch,), device=x.device, dtype=estimator_dtype
+            ),
+            static_spks_in=torch.zeros(
+                (cfg_batch, spks.size(1)),
+                device=x.device,
+                dtype=estimator_dtype,
+            ),
+            static_cond_in=torch.zeros(
+                (cfg_batch, channels, timesteps),
+                device=x.device,
+                dtype=estimator_dtype,
+            ),
+            static_out=torch.empty_like(x),
+        )
+        try:
+            with torch.no_grad():
+                self._run_static(cfm, entry)
+            torch.accelerator.synchronize(x.device)
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.profiler.record_function(
+                f"cosyvoice3_cfm_cudagraph_capture_b{batch}_t{timesteps}"
+            ):
+                with torch.no_grad(), torch.cuda.graph(
+                    graph, pool=current_platform.get_global_graph_pool()
+                ):
+                    entry.static_out = self._run_static(cfm, entry)
+            entry.graph = graph
+        except Exception:
+            logger.warning(
+                "Disabling CosyVoice3 CFM CUDA Graph after capture failure "
+                "for shape=%s",
+                tuple(x.shape),
+                exc_info=True,
+            )
+            self.enabled = False
+            self._stats["failures"] += 1
+            return None
+        self._stats["captures"] += 1
+        return entry
+
+    def _run_static(
+        self, cfm: "ConditionalCFM", entry: _CFMEulerGraphEntry
+    ) -> torch.Tensor:
+        batch = entry.static_x.size(0)
+        x = entry.static_x
+        t_span = entry.static_t_span
+        for step in range(1, len(t_span)):
+            dt = t_span[step] - t_span[step - 1]
+            entry.static_x_in[:batch].copy_(x)
+            entry.static_x_in[batch:].copy_(x)
+            entry.static_mask_in[:batch].copy_(entry.static_mask)
+            entry.static_mask_in[batch:].copy_(entry.static_mask)
+            entry.static_mu_in.zero_()
+            entry.static_mu_in[:batch].copy_(entry.static_mu)
+            entry.static_t_in[:] = t_span[step - 1]
+            entry.static_spks_in.zero_()
+            entry.static_spks_in[:batch].copy_(entry.static_spks)
+            entry.static_cond_in.zero_()
+            entry.static_cond_in[:batch].copy_(entry.static_cond)
+            dphi_dt = cfm.forward_estimator(
+                entry.static_x_in,
+                entry.static_mask_in,
+                entry.static_mu_in,
+                entry.static_t_in,
+                entry.static_spks_in,
+                entry.static_cond_in,
+            )
+            dphi_dt, cfg_dphi_dt = torch.split(
+                dphi_dt, [batch, batch], dim=0
+            )
+            dphi_dt = (
+                (1.0 + cfm.inference_cfg_rate) * dphi_dt
+                - cfm.inference_cfg_rate * cfg_dphi_dt
+            )
+            x = x + dt * dphi_dt
+        return x
 
 
 class BASECFM(torch.nn.Module, ABC):
@@ -51,6 +365,13 @@ class ConditionalCFM(BASECFM):
         in_channels = in_channels + (spk_emb_dim if n_spks > 0 else 0)
         # Just change the architecture of the estimator here
         self.estimator = estimator
+        self._cuda_graph_runner = CUDAGraphCFMEulerRunner(
+            enabled=_cosyvoice3_cfm_cuda_graph_enabled(),
+            max_graphs=_cosyvoice3_cfm_cuda_graph_max_graphs(),
+        )
+
+    def get_cuda_graph_stats(self) -> dict[str, int | float]:
+        return self._cuda_graph_runner.stats()
 
     @torch.inference_mode()
     def forward(
@@ -112,6 +433,18 @@ class ConditionalCFM(BASECFM):
 
         sol = []
 
+        graph_out = self._cuda_graph_runner.try_replay(
+            self,
+            x=x,
+            t_span=t_span,
+            mu=mu,
+            mask=mask,
+            spks=spks,
+            cond=cond,
+        )
+        if graph_out is not None:
+            return graph_out.float()
+
         # Do not use concat, it may cause memory format changed and trt infer with wrong results!
         # NOTE when flow run in amp mode, x.dtype is float32, which cause nan in trt fp16
         # inference, so set dtype=spks.dtype.  The batch is doubled for CFG:
@@ -119,13 +452,29 @@ class ConditionalCFM(BASECFM):
         batch_size = int(x.size(0))
         estimator_batch = 2 * batch_size
         estimator_dtype = spks.dtype if spks is not None else x.dtype
+        channels = int(x.size(1))
+        spk_dim = int(spks.size(1)) if spks is not None else int(self.spk_emb_dim)
         with torch.profiler.record_function("cosyvoice3_cfm_cfg_allocate_2b"):
-            x_in = torch.zeros([estimator_batch, 80, x.size(2)], device=x.device, dtype=estimator_dtype)
+            x_in = torch.zeros(
+                [estimator_batch, channels, x.size(2)],
+                device=x.device,
+                dtype=estimator_dtype,
+            )
             mask_in = torch.zeros([estimator_batch, 1, x.size(2)], device=x.device, dtype=estimator_dtype)
-            mu_in = torch.zeros([estimator_batch, 80, x.size(2)], device=x.device, dtype=estimator_dtype)
+            mu_in = torch.zeros(
+                [estimator_batch, channels, x.size(2)],
+                device=x.device,
+                dtype=estimator_dtype,
+            )
             t_in = torch.zeros([estimator_batch], device=x.device, dtype=estimator_dtype)
-            spks_in = torch.zeros([estimator_batch, 80], device=x.device, dtype=estimator_dtype)
-            cond_in = torch.zeros([estimator_batch, 80, x.size(2)], device=x.device, dtype=estimator_dtype)
+            spks_in = torch.zeros(
+                [estimator_batch, spk_dim], device=x.device, dtype=estimator_dtype
+            )
+            cond_in = torch.zeros(
+                [estimator_batch, channels, x.size(2)],
+                device=x.device,
+                dtype=estimator_dtype,
+            )
         for step in range(1, len(t_span)):
             # Classifier-Free Guidance inference introduced in VoiceBox
             with torch.profiler.record_function("cosyvoice3_cfm_cfg_prepare_2b"):
