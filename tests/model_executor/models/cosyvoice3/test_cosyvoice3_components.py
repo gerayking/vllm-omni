@@ -488,9 +488,9 @@ def test_cfm_cuda_graph_env_defaults_disabled(monkeypatch):
     monkeypatch.delenv("COSYVOICE3_CFM_CUDA_GRAPH_PROFILE_SHAPES", raising=False)
 
     assert _cosyvoice3_cfm_cuda_graph_enabled() is False
-    assert _cosyvoice3_cfm_cuda_graph_max_graphs() == 4
-    assert _cosyvoice3_cfm_cuda_graph_timestep_buckets() == ()
-    assert _cosyvoice3_cfm_cuda_graph_batch_buckets() == ()
+    assert _cosyvoice3_cfm_cuda_graph_max_graphs() == 12
+    assert _cosyvoice3_cfm_cuda_graph_timestep_buckets() == (330, 450, 570, 690, 780, 900)
+    assert _cosyvoice3_cfm_cuda_graph_batch_buckets() == (1, 2)
     assert _cosyvoice3_cfm_cuda_graph_profile_shapes() is False
 
 
@@ -514,6 +514,11 @@ def test_cfm_cuda_graph_env_accepts_enabled(monkeypatch):
     assert _cosyvoice3_cfm_cuda_graph_timestep_buckets() == (8, 16, 32)
     assert _cosyvoice3_cfm_cuda_graph_batch_buckets() == (1, 2, 4)
     assert _cosyvoice3_cfm_cuda_graph_profile_shapes() is True
+
+    monkeypatch.setenv("COSYVOICE3_CFM_CUDA_GRAPH_TIMESTEP_BUCKETS", "exact")
+    monkeypatch.setenv("COSYVOICE3_CFM_CUDA_GRAPH_BATCH_BUCKETS", "exact")
+    assert _cosyvoice3_cfm_cuda_graph_timestep_buckets() == ()
+    assert _cosyvoice3_cfm_cuda_graph_batch_buckets() == ()
 
     monkeypatch.delenv("COSYVOICE3_CFM_CUDA_GRAPH", raising=False)
     monkeypatch.setenv("COSYVOICE3_CFM_CUDAGRAPH", "1")

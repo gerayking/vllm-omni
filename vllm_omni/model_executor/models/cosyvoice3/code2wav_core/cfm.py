@@ -20,6 +20,13 @@ from vllm_omni.model_executor.models.cosyvoice3.utils import make_pad_mask
 
 logger = init_logger(__name__)
 
+# Collected from 40 Seed-TTS streaming requests (20 en + 20 zh) with
+# codec_chunk_frames=15. These buckets cover 95% of CFM calls while keeping
+# estimated attention padding overhead near 17% for the covered requests.
+_DEFAULT_CFM_CUDA_GRAPH_TIMESTEP_BUCKETS = (330, 450, 570, 690, 780, 900)
+_DEFAULT_CFM_CUDA_GRAPH_BATCH_BUCKETS = (1, 2)
+_DEFAULT_CFM_CUDA_GRAPH_MAX_GRAPHS = 12
+
 
 def _cosyvoice3_cfm_cuda_graph_enabled() -> bool:
     value = (
@@ -34,19 +41,26 @@ def _cosyvoice3_cfm_cuda_graph_enabled() -> bool:
 
 
 def _cosyvoice3_cfm_cuda_graph_max_graphs() -> int:
-    value = os.environ.get("COSYVOICE3_CFM_CUDA_GRAPH_MAX_GRAPHS", "4")
+    value = os.environ.get(
+        "COSYVOICE3_CFM_CUDA_GRAPH_MAX_GRAPHS",
+        str(_DEFAULT_CFM_CUDA_GRAPH_MAX_GRAPHS),
+    )
     try:
         return max(1, int(value))
     except ValueError:
         logger.warning(
-            "CosyVoice3 CFM CUDA Graph: unsupported COSYVOICE3_CFM_CUDA_GRAPH_MAX_GRAPHS=%r; using 4",
+            "CosyVoice3 CFM CUDA Graph: unsupported COSYVOICE3_CFM_CUDA_GRAPH_MAX_GRAPHS=%r; using %d",
             value,
+            _DEFAULT_CFM_CUDA_GRAPH_MAX_GRAPHS,
         )
-        return 4
+        return _DEFAULT_CFM_CUDA_GRAPH_MAX_GRAPHS
 
 
-def _parse_cuda_graph_buckets(env_name: str) -> tuple[int, ...]:
-    value = os.environ.get(env_name, "").strip().lower()
+def _parse_cuda_graph_buckets(env_name: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    configured = os.environ.get(env_name)
+    if configured is None:
+        return default
+    value = configured.strip().lower()
     if value in ("", "exact", "none", "off", "0"):
         return ()
     try:
@@ -60,11 +74,17 @@ def _parse_cuda_graph_buckets(env_name: str) -> tuple[int, ...]:
 
 
 def _cosyvoice3_cfm_cuda_graph_timestep_buckets() -> tuple[int, ...]:
-    return _parse_cuda_graph_buckets("COSYVOICE3_CFM_CUDA_GRAPH_TIMESTEP_BUCKETS")
+    return _parse_cuda_graph_buckets(
+        "COSYVOICE3_CFM_CUDA_GRAPH_TIMESTEP_BUCKETS",
+        _DEFAULT_CFM_CUDA_GRAPH_TIMESTEP_BUCKETS,
+    )
 
 
 def _cosyvoice3_cfm_cuda_graph_batch_buckets() -> tuple[int, ...]:
-    return _parse_cuda_graph_buckets("COSYVOICE3_CFM_CUDA_GRAPH_BATCH_BUCKETS")
+    return _parse_cuda_graph_buckets(
+        "COSYVOICE3_CFM_CUDA_GRAPH_BATCH_BUCKETS",
+        _DEFAULT_CFM_CUDA_GRAPH_BATCH_BUCKETS,
+    )
 
 
 def _cosyvoice3_cfm_cuda_graph_profile_shapes() -> bool:
