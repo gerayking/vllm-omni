@@ -473,29 +473,47 @@ def test_code2wav_streaming_batch_pads_codec_tokens_and_preserves_lengths():
 
 def test_cfm_cuda_graph_env_defaults_disabled(monkeypatch):
     from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import (
+        _cosyvoice3_cfm_cuda_graph_batch_buckets,
         _cosyvoice3_cfm_cuda_graph_enabled,
         _cosyvoice3_cfm_cuda_graph_max_graphs,
+        _cosyvoice3_cfm_cuda_graph_profile_shapes,
+        _cosyvoice3_cfm_cuda_graph_timestep_buckets,
     )
 
     monkeypatch.delenv("COSYVOICE3_CFM_CUDA_GRAPH", raising=False)
     monkeypatch.delenv("COSYVOICE3_CFM_CUDAGRAPH", raising=False)
     monkeypatch.delenv("COSYVOICE3_CFM_CUDA_GRAPH_MAX_GRAPHS", raising=False)
+    monkeypatch.delenv("COSYVOICE3_CFM_CUDA_GRAPH_TIMESTEP_BUCKETS", raising=False)
+    monkeypatch.delenv("COSYVOICE3_CFM_CUDA_GRAPH_BATCH_BUCKETS", raising=False)
+    monkeypatch.delenv("COSYVOICE3_CFM_CUDA_GRAPH_PROFILE_SHAPES", raising=False)
 
     assert _cosyvoice3_cfm_cuda_graph_enabled() is False
     assert _cosyvoice3_cfm_cuda_graph_max_graphs() == 4
+    assert _cosyvoice3_cfm_cuda_graph_timestep_buckets() == ()
+    assert _cosyvoice3_cfm_cuda_graph_batch_buckets() == ()
+    assert _cosyvoice3_cfm_cuda_graph_profile_shapes() is False
 
 
 def test_cfm_cuda_graph_env_accepts_enabled(monkeypatch):
     from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import (
+        _cosyvoice3_cfm_cuda_graph_batch_buckets,
         _cosyvoice3_cfm_cuda_graph_enabled,
         _cosyvoice3_cfm_cuda_graph_max_graphs,
+        _cosyvoice3_cfm_cuda_graph_profile_shapes,
+        _cosyvoice3_cfm_cuda_graph_timestep_buckets,
     )
 
     monkeypatch.setenv("COSYVOICE3_CFM_CUDA_GRAPH", "1")
     monkeypatch.setenv("COSYVOICE3_CFM_CUDA_GRAPH_MAX_GRAPHS", "2")
+    monkeypatch.setenv("COSYVOICE3_CFM_CUDA_GRAPH_TIMESTEP_BUCKETS", "16, 8,16,32")
+    monkeypatch.setenv("COSYVOICE3_CFM_CUDA_GRAPH_BATCH_BUCKETS", "1,2,4")
+    monkeypatch.setenv("COSYVOICE3_CFM_CUDA_GRAPH_PROFILE_SHAPES", "true")
 
     assert _cosyvoice3_cfm_cuda_graph_enabled() is True
     assert _cosyvoice3_cfm_cuda_graph_max_graphs() == 2
+    assert _cosyvoice3_cfm_cuda_graph_timestep_buckets() == (8, 16, 32)
+    assert _cosyvoice3_cfm_cuda_graph_batch_buckets() == (1, 2, 4)
+    assert _cosyvoice3_cfm_cuda_graph_profile_shapes() is True
 
     monkeypatch.delenv("COSYVOICE3_CFM_CUDA_GRAPH", raising=False)
     monkeypatch.setenv("COSYVOICE3_CFM_CUDAGRAPH", "1")
@@ -580,10 +598,12 @@ def test_cfm_cuda_graph_cache_full_falls_back_without_evicting(monkeypatch):
     monkeypatch.setattr(
         runner,
         "_ineligible_reason",
-        lambda cfm, *, x, spks, cond: None,
+        lambda cfm, *, x, mu, mask, spks, cond: None,
     )
 
-    def capture(cfm, *, x, t_span, mu, mask, spks, cond):
+    def capture(cfm, *, x, t_span, mu, mask, spks, cond, bucket_batch, bucket_timesteps):
+        assert bucket_batch == x.size(0)
+        assert bucket_timesteps == x.size(2)
         runner._stats["captures"] += 1
         return make_entry(x, t_span, mu, mask, spks, cond)
 
@@ -614,7 +634,94 @@ def test_cfm_cuda_graph_cache_full_falls_back_without_evicting(monkeypatch):
     assert stats["cache_full_fallbacks"] == 1
     assert stats["fallbacks"] == 1
     assert stats["replays"] == 2
+    assert stats["cache_hits"] == 1
     assert stats["unique_graphs"] == 1
+
+
+def test_cfm_cuda_graph_bucket_reuses_padded_static_buffers(monkeypatch):
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import (
+        CUDAGraphCFMEulerRunner,
+        _CFMEulerGraphEntry,
+    )
+
+    class FakeCFM:
+        t_scheduler = "linear"
+        inference_cfg_rate = 0.0
+        estimator = nn.Identity()
+
+    runner = CUDAGraphCFMEulerRunner(
+        enabled=True,
+        max_graphs=1,
+        timestep_buckets=(8,),
+        batch_buckets=(2,),
+    )
+    monkeypatch.setattr(runner, "_ineligible_reason", lambda cfm, *, x, mu, mask, spks, cond: None)
+
+    def capture(cfm, *, x, t_span, mu, mask, spks, cond, bucket_batch, bucket_timesteps):
+        entry = _CFMEulerGraphEntry(
+            graph=None,
+            static_x=torch.zeros(bucket_batch, x.size(1), bucket_timesteps),
+            static_t_span=t_span.clone(),
+            static_mu=torch.zeros(bucket_batch, mu.size(1), bucket_timesteps),
+            static_mask=torch.zeros(bucket_batch, mask.size(1), bucket_timesteps),
+            static_spks=torch.zeros(bucket_batch, spks.size(1)),
+            static_cond=torch.zeros(bucket_batch, cond.size(1), bucket_timesteps),
+            static_x_in=torch.empty(0),
+            static_mask_in=torch.empty(0),
+            static_mu_in=torch.empty(0),
+            static_t_in=torch.empty(0),
+            static_spks_in=torch.empty(0),
+            static_cond_in=torch.empty(0),
+            static_out=torch.zeros(bucket_batch, x.size(1), bucket_timesteps),
+        )
+
+        class FakeGraph:
+            def replay(self):
+                entry.static_out.copy_(entry.static_x + 1)
+
+        entry.graph = FakeGraph()
+        runner._copy_static_inputs(
+            entry,
+            x=x,
+            t_span=t_span,
+            mu=mu,
+            mask=mask,
+            spks=spks,
+            cond=cond,
+        )
+        runner._stats["captures"] += 1
+        return entry
+
+    monkeypatch.setattr(runner, "_capture", capture)
+    t_span = torch.linspace(0, 1, 3)
+
+    def replay(batch: int, length: int):
+        x = torch.arange(batch * 2 * length, dtype=torch.float32).reshape(batch, 2, length)
+        return x, runner.try_replay(
+            FakeCFM(),
+            x=x,
+            t_span=t_span,
+            mu=torch.zeros_like(x),
+            mask=torch.ones(batch, 1, length),
+            spks=torch.ones(batch, 2),
+            cond=torch.zeros_like(x),
+        )
+
+    x1, out1 = replay(1, 5)
+    x2, out2 = replay(2, 7)
+
+    assert torch.equal(out1, x1 + 1)
+    assert torch.equal(out2, x2 + 1)
+    entry = next(iter(runner._cache.values()))
+    assert entry.static_x.shape == (2, 2, 8)
+    assert torch.count_nonzero(entry.static_x[:, :, 7:]) == 0
+
+    stats = runner.stats()
+    assert stats["captures"] == 1
+    assert stats["cache_hits"] == 1
+    assert stats["shape_misses"] == 1
+    assert stats["bucketed_calls"] == 2
+    assert stats["replays"] == 2
 
 
 @pytest.mark.core_model
@@ -675,3 +782,70 @@ def test_conditional_cfm_cuda_graph_replays_match_eager(monkeypatch):
     assert stats["unique_graphs"] == 1
     assert stats["fallbacks"] == 0
     assert stats["replay_hit_rate"] == 1.0
+
+
+@pytest.mark.core_model
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graph capture")
+def test_conditional_cfm_bucketed_cuda_graph_matches_eager(monkeypatch):
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import (
+        ConditionalCFM,
+    )
+
+    class TinyEstimator(nn.Module):
+        def forward(self, x, mask, mu, t, spks, cond):
+            spk_term = spks.sum(dim=1, keepdim=True).unsqueeze(-1)
+            t_term = t.view(-1, 1, 1)
+            return (x * 0.125 + mu * 0.25 + cond * 0.5 + spk_term * 0.01 + t_term * 0.05) * mask
+
+    def build_cfm():
+        return (
+            ConditionalCFM(
+                in_channels=2,
+                cfm_params=SimpleNamespace(
+                    solver="euler",
+                    t_scheduler="linear",
+                    training_cfg_rate=0.0,
+                    inference_cfg_rate=0.0,
+                ),
+                n_spks=1,
+                spk_emb_dim=2,
+                estimator=TinyEstimator().cuda().eval(),
+            )
+            .cuda()
+            .eval()
+        )
+
+    def inputs(batch: int, length: int):
+        x = torch.randn(batch, 2, length, device="cuda")
+        return {
+            "x": x,
+            "t_span": torch.linspace(0, 1, 4, device="cuda"),
+            "mu": torch.randn_like(x),
+            "mask": torch.ones(batch, 1, length, device="cuda"),
+            "spks": torch.randn(batch, 2, device="cuda"),
+            "cond": torch.randn_like(x),
+        }
+
+    first = inputs(1, 5)
+    second = inputs(2, 7)
+    monkeypatch.delenv("COSYVOICE3_CFM_CUDA_GRAPH", raising=False)
+    eager = build_cfm()
+    eager_first = eager.solve_euler(**first)
+    eager_second = eager.solve_euler(**second)
+
+    monkeypatch.setenv("COSYVOICE3_CFM_CUDA_GRAPH", "1")
+    monkeypatch.setenv("COSYVOICE3_CFM_CUDA_GRAPH_TIMESTEP_BUCKETS", "8")
+    monkeypatch.setenv("COSYVOICE3_CFM_CUDA_GRAPH_BATCH_BUCKETS", "2")
+    graph = build_cfm()
+    graph_first = graph.solve_euler(**first)
+    graph_second = graph.solve_euler(**second)
+    torch.accelerator.synchronize()
+
+    assert torch.allclose(graph_first, eager_first)
+    assert torch.allclose(graph_second, eager_second)
+    stats = graph.get_cuda_graph_stats()
+    assert stats["captures"] == 1
+    assert stats["cache_hits"] == 1
+    assert stats["shape_misses"] == 1
+    assert stats["bucketed_calls"] == 2
+    assert stats["fallbacks"] == 0

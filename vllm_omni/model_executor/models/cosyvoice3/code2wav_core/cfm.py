@@ -45,6 +45,37 @@ def _cosyvoice3_cfm_cuda_graph_max_graphs() -> int:
         return 4
 
 
+def _parse_cuda_graph_buckets(env_name: str) -> tuple[int, ...]:
+    value = os.environ.get(env_name, "").strip().lower()
+    if value in ("", "exact", "none", "off", "0"):
+        return ()
+    try:
+        buckets = tuple(sorted({int(item.strip()) for item in value.split(",") if item.strip()}))
+    except ValueError:
+        buckets = ()
+    if not buckets or any(bucket <= 0 for bucket in buckets):
+        logger.warning("CosyVoice3 CFM CUDA Graph: invalid %s=%r; using exact shapes", env_name, value)
+        return ()
+    return buckets
+
+
+def _cosyvoice3_cfm_cuda_graph_timestep_buckets() -> tuple[int, ...]:
+    return _parse_cuda_graph_buckets("COSYVOICE3_CFM_CUDA_GRAPH_TIMESTEP_BUCKETS")
+
+
+def _cosyvoice3_cfm_cuda_graph_batch_buckets() -> tuple[int, ...]:
+    return _parse_cuda_graph_buckets("COSYVOICE3_CFM_CUDA_GRAPH_BATCH_BUCKETS")
+
+
+def _cosyvoice3_cfm_cuda_graph_profile_shapes() -> bool:
+    return os.environ.get("COSYVOICE3_CFM_CUDA_GRAPH_PROFILE_SHAPES", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 @dataclass
 class _CFMEulerGraphEntry:
     graph: Any
@@ -66,18 +97,34 @@ class _CFMEulerGraphEntry:
 class CUDAGraphCFMEulerRunner:
     """Capture and replay the complete CosyVoice3 CFM Euler loop per shape."""
 
-    def __init__(self, *, enabled: bool, max_graphs: int = 4) -> None:
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        max_graphs: int = 4,
+        timestep_buckets: tuple[int, ...] = (),
+        batch_buckets: tuple[int, ...] = (),
+        profile_shapes: bool = False,
+    ) -> None:
         self.enabled = bool(enabled)
         self.max_graphs = max(1, int(max_graphs))
+        self.timestep_buckets = tuple(sorted(set(timestep_buckets)))
+        self.batch_buckets = tuple(sorted(set(batch_buckets)))
+        self.profile_shapes = bool(profile_shapes)
         self._cache: OrderedDict[tuple[object, ...], _CFMEulerGraphEntry] = OrderedDict()
         self._stats = {
             "calls": 0,
             "captures": 0,
             "replays": 0,
+            "cache_hits": 0,
             "fallbacks": 0,
             "failures": 0,
             "shape_misses": 0,
             "cache_full_fallbacks": 0,
+            "bucket_overflow_fallbacks": 0,
+            "bucketed_calls": 0,
+            "padded_batch_rows": 0,
+            "padded_timesteps": 0,
         }
         self.last_call_info: dict[str, object] = {}
 
@@ -88,6 +135,7 @@ class CUDAGraphCFMEulerRunner:
         stats["total_euler_calls"] = stats["calls"]
         calls = int(stats["calls"])
         stats["replay_hit_rate"] = float(stats["replays"] / calls) if calls else 0.0
+        stats["cache_hit_rate"] = float(stats["cache_hits"] / calls) if calls else 0.0
         return stats
 
     def try_replay(
@@ -102,19 +150,51 @@ class CUDAGraphCFMEulerRunner:
         cond: torch.Tensor | None,
     ) -> torch.Tensor | None:
         self._stats["calls"] += 1
-        ineligible_reason = self._ineligible_reason(cfm, x=x, spks=spks, cond=cond)
+        requested_batch = int(x.size(0))
+        requested_timesteps = int(x.size(2))
+        bucket_shape = self._bucket_shape(requested_batch, requested_timesteps)
+        ineligible_reason = self._ineligible_reason(
+            cfm,
+            x=x,
+            mu=mu,
+            mask=mask,
+            spks=spks,
+            cond=cond,
+        )
         if ineligible_reason is not None:
             self._record_fallback(ineligible_reason, x)
+            self._profile_call(x, bucket_shape, ineligible_reason)
+            return None
+        if bucket_shape is None:
+            self._stats["bucket_overflow_fallbacks"] += 1
+            self._record_fallback("bucket_overflow", x)
+            self._profile_call(x, None, "bucket_overflow")
             return None
 
         assert spks is not None and cond is not None
-        key = self._key(cfm, x=x, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond)
+        bucket_batch, bucket_timesteps = bucket_shape
+        if bucket_shape != (requested_batch, requested_timesteps):
+            self._stats["bucketed_calls"] += 1
+            self._stats["padded_batch_rows"] += bucket_batch - requested_batch
+            self._stats["padded_timesteps"] += bucket_batch * (bucket_timesteps - requested_timesteps)
+        key = self._key(
+            cfm,
+            x=x,
+            t_span=t_span,
+            mu=mu,
+            mask=mask,
+            spks=spks,
+            cond=cond,
+            bucket_batch=bucket_batch,
+            bucket_timesteps=bucket_timesteps,
+        )
         entry = self._cache.get(key)
         if entry is None:
             self._stats["shape_misses"] += 1
             if len(self._cache) >= self.max_graphs:
                 self._stats["cache_full_fallbacks"] += 1
                 self._record_fallback("cache_full", x)
+                self._profile_call(x, bucket_shape, "cache_full")
                 return None
             entry = self._capture(
                 cfm,
@@ -124,20 +204,27 @@ class CUDAGraphCFMEulerRunner:
                 mask=mask,
                 spks=spks,
                 cond=cond,
+                bucket_batch=bucket_batch,
+                bucket_timesteps=bucket_timesteps,
             )
             if entry is None:
                 self._record_fallback("capture_failed", x)
+                self._profile_call(x, bucket_shape, "capture_failed")
                 return None
             self._cache[key] = entry
             reason = "capture"
         else:
             self._cache.move_to_end(key)
-            entry.static_x.copy_(x)
-            entry.static_t_span.copy_(t_span)
-            entry.static_mu.copy_(mu)
-            entry.static_mask.copy_(mask)
-            entry.static_spks.copy_(spks)
-            entry.static_cond.copy_(cond)
+            self._copy_static_inputs(
+                entry,
+                x=x,
+                t_span=t_span,
+                mu=mu,
+                mask=mask,
+                spks=spks,
+                cond=cond,
+            )
+            self._stats["cache_hits"] += 1
             reason = "hit"
 
         with torch.profiler.record_function(f"cosyvoice3_cfm_cudagraph_replay_b{x.size(0)}_t{x.size(2)}"):
@@ -147,9 +234,11 @@ class CUDAGraphCFMEulerRunner:
             "mode": "graph",
             "reason": reason,
             "shape": tuple(x.shape),
+            "bucket_shape": (bucket_batch, int(x.size(1)), bucket_timesteps),
             "cache_size": len(self._cache),
         }
-        return entry.static_out.clone()
+        self._profile_call(x, bucket_shape, reason)
+        return entry.static_out[:requested_batch, :, :requested_timesteps].clone()
 
     def _record_fallback(self, reason: str, x: torch.Tensor) -> None:
         self._stats["fallbacks"] += 1
@@ -167,20 +256,66 @@ class CUDAGraphCFMEulerRunner:
         cfm: "ConditionalCFM",
         *,
         x: torch.Tensor,
+        mu: torch.Tensor,
+        mask: torch.Tensor,
         spks: torch.Tensor | None,
         cond: torch.Tensor | None,
     ) -> str | None:
         if not self.enabled:
             return "disabled"
+        if (
+            x.ndim != 3
+            or x.size(0) == 0
+            or mu.shape != x.shape
+            or mask.shape != (x.size(0), 1, x.size(2))
+            or spks is None
+            or spks.ndim != 2
+            or spks.size(0) != x.size(0)
+            or cond is None
+            or cond.shape != x.shape
+        ):
+            return "unsupported_shapes"
         if x.device.type != "cuda":
             return "non_cuda"
-        if spks is None or cond is None:
-            return "missing_conditioning"
         if torch.cuda.is_current_stream_capturing():
             return "nested_capture"
         if not isinstance(cfm.estimator, torch.nn.Module):
             return "non_torch_estimator"
         return None
+
+    @staticmethod
+    def _select_bucket(value: int, buckets: tuple[int, ...]) -> int | None:
+        if not buckets:
+            return value
+        return next((bucket for bucket in buckets if bucket >= value), None)
+
+    def _bucket_shape(self, batch: int, timesteps: int) -> tuple[int, int] | None:
+        bucket_batch = self._select_bucket(batch, self.batch_buckets)
+        bucket_timesteps = self._select_bucket(timesteps, self.timestep_buckets)
+        if bucket_batch is None or bucket_timesteps is None:
+            return None
+        return bucket_batch, bucket_timesteps
+
+    def _profile_call(
+        self,
+        x: torch.Tensor,
+        bucket_shape: tuple[int, int] | None,
+        outcome: str,
+    ) -> None:
+        if not self.profile_shapes:
+            return
+        bucket_batch, bucket_timesteps = bucket_shape or (-1, -1)
+        logger.info(
+            "COSYVOICE3_CFM_GRAPH_PROFILE batch=%d channels=%d timesteps=%d "
+            "bucket_batch=%d bucket_timesteps=%d outcome=%s cache_size=%d",
+            x.size(0),
+            x.size(1),
+            x.size(2),
+            bucket_batch,
+            bucket_timesteps,
+            outcome,
+            len(self._cache),
+        )
 
     def _key(
         self,
@@ -192,21 +327,23 @@ class CUDAGraphCFMEulerRunner:
         mask: torch.Tensor,
         spks: torch.Tensor,
         cond: torch.Tensor,
+        bucket_batch: int,
+        bucket_timesteps: int,
     ) -> tuple[object, ...]:
         return (
             x.device.type,
             x.device.index,
-            tuple(x.shape),
+            (bucket_batch, x.size(1), bucket_timesteps),
             x.dtype,
             tuple(t_span.shape),
             t_span.dtype,
-            tuple(mu.shape),
+            (bucket_batch, mu.size(1), bucket_timesteps),
             mu.dtype,
-            tuple(mask.shape),
+            (bucket_batch, mask.size(1), bucket_timesteps),
             mask.dtype,
-            tuple(spks.shape),
+            (bucket_batch, spks.size(1)),
             spks.dtype,
-            tuple(cond.shape),
+            (bucket_batch, cond.size(1), bucket_timesteps),
             cond.dtype,
             cfm.t_scheduler,
             float(cfm.inference_cfg_rate),
@@ -222,30 +359,52 @@ class CUDAGraphCFMEulerRunner:
         mask: torch.Tensor,
         spks: torch.Tensor,
         cond: torch.Tensor,
+        bucket_batch: int,
+        bucket_timesteps: int,
     ) -> _CFMEulerGraphEntry | None:
-        batch, channels, timesteps = x.shape
-        cfg_batch = 2 * batch
+        channels = int(x.size(1))
+        cfg_batch = 2 * bucket_batch
         estimator_dtype = spks.dtype
         entry = _CFMEulerGraphEntry(
             graph=None,
-            static_x=x.contiguous().clone(),
+            static_x=torch.zeros(
+                (bucket_batch, channels, bucket_timesteps),
+                device=x.device,
+                dtype=x.dtype,
+            ),
             static_t_span=t_span.contiguous().clone(),
-            static_mu=mu.contiguous().clone(),
-            static_mask=mask.contiguous().clone(),
-            static_spks=spks.contiguous().clone(),
-            static_cond=cond.contiguous().clone(),
+            static_mu=torch.zeros(
+                (bucket_batch, mu.size(1), bucket_timesteps),
+                device=mu.device,
+                dtype=mu.dtype,
+            ),
+            static_mask=torch.zeros(
+                (bucket_batch, mask.size(1), bucket_timesteps),
+                device=mask.device,
+                dtype=mask.dtype,
+            ),
+            static_spks=torch.zeros(
+                (bucket_batch, spks.size(1)),
+                device=spks.device,
+                dtype=spks.dtype,
+            ),
+            static_cond=torch.zeros(
+                (bucket_batch, cond.size(1), bucket_timesteps),
+                device=cond.device,
+                dtype=cond.dtype,
+            ),
             static_x_in=torch.zeros(
-                (cfg_batch, channels, timesteps),
+                (cfg_batch, channels, bucket_timesteps),
                 device=x.device,
                 dtype=estimator_dtype,
             ),
             static_mask_in=torch.zeros(
-                (cfg_batch, 1, timesteps),
+                (cfg_batch, 1, bucket_timesteps),
                 device=x.device,
                 dtype=estimator_dtype,
             ),
             static_mu_in=torch.zeros(
-                (cfg_batch, channels, timesteps),
+                (cfg_batch, channels, bucket_timesteps),
                 device=x.device,
                 dtype=estimator_dtype,
             ),
@@ -256,11 +415,24 @@ class CUDAGraphCFMEulerRunner:
                 dtype=estimator_dtype,
             ),
             static_cond_in=torch.zeros(
-                (cfg_batch, channels, timesteps),
+                (cfg_batch, channels, bucket_timesteps),
                 device=x.device,
                 dtype=estimator_dtype,
             ),
-            static_out=torch.empty_like(x),
+            static_out=torch.empty(
+                (bucket_batch, channels, bucket_timesteps),
+                device=x.device,
+                dtype=x.dtype,
+            ),
+        )
+        self._copy_static_inputs(
+            entry,
+            x=x,
+            t_span=t_span,
+            mu=mu,
+            mask=mask,
+            spks=spks,
+            cond=cond,
         )
         try:
             with torch.no_grad():
@@ -268,14 +440,16 @@ class CUDAGraphCFMEulerRunner:
             torch.accelerator.synchronize(x.device)
 
             graph = torch.cuda.CUDAGraph()
-            with torch.profiler.record_function(f"cosyvoice3_cfm_cudagraph_capture_b{batch}_t{timesteps}"):
+            with torch.profiler.record_function(
+                f"cosyvoice3_cfm_cudagraph_capture_b{bucket_batch}_t{bucket_timesteps}"
+            ):
                 with torch.no_grad(), torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
                     entry.static_out = self._run_static(cfm, entry)
             entry.graph = graph
         except Exception:
             logger.warning(
                 "Disabling CosyVoice3 CFM CUDA Graph after capture failure for shape=%s",
-                tuple(x.shape),
+                (bucket_batch, channels, bucket_timesteps),
                 exc_info=True,
             )
             self.enabled = False
@@ -283,6 +457,39 @@ class CUDAGraphCFMEulerRunner:
             return None
         self._stats["captures"] += 1
         return entry
+
+    @staticmethod
+    def _copy_static_inputs(
+        entry: _CFMEulerGraphEntry,
+        *,
+        x: torch.Tensor,
+        t_span: torch.Tensor,
+        mu: torch.Tensor,
+        mask: torch.Tensor,
+        spks: torch.Tensor,
+        cond: torch.Tensor,
+    ) -> None:
+        batch = int(x.size(0))
+        timesteps = int(x.size(2))
+        entry.static_x.zero_()
+        entry.static_mu.zero_()
+        entry.static_mask.zero_()
+        entry.static_spks.zero_()
+        entry.static_cond.zero_()
+        entry.static_t_span.copy_(t_span)
+        entry.static_x[:batch, :, :timesteps].copy_(x)
+        entry.static_mu[:batch, :, :timesteps].copy_(mu)
+        entry.static_mask[:batch, :, :timesteps].copy_(mask)
+        entry.static_spks[:batch].copy_(spks)
+        entry.static_cond[:batch, :, :timesteps].copy_(cond)
+
+        padded_batch = int(entry.static_x.size(0)) - batch
+        if padded_batch > 0:
+            entry.static_x[batch:].copy_(entry.static_x[batch - 1 : batch].expand(padded_batch, -1, -1))
+            entry.static_mu[batch:].copy_(entry.static_mu[batch - 1 : batch].expand(padded_batch, -1, -1))
+            entry.static_mask[batch:].copy_(entry.static_mask[batch - 1 : batch].expand(padded_batch, -1, -1))
+            entry.static_spks[batch:].copy_(entry.static_spks[batch - 1 : batch].expand(padded_batch, -1))
+            entry.static_cond[batch:].copy_(entry.static_cond[batch - 1 : batch].expand(padded_batch, -1, -1))
 
     def _run_static(self, cfm: "ConditionalCFM", entry: _CFMEulerGraphEntry) -> torch.Tensor:
         batch = entry.static_x.size(0)
@@ -353,6 +560,9 @@ class ConditionalCFM(BASECFM):
         self._cuda_graph_runner = CUDAGraphCFMEulerRunner(
             enabled=_cosyvoice3_cfm_cuda_graph_enabled(),
             max_graphs=_cosyvoice3_cfm_cuda_graph_max_graphs(),
+            timestep_buckets=_cosyvoice3_cfm_cuda_graph_timestep_buckets(),
+            batch_buckets=_cosyvoice3_cfm_cuda_graph_batch_buckets(),
+            profile_shapes=_cosyvoice3_cfm_cuda_graph_profile_shapes(),
         )
 
     def get_cuda_graph_stats(self) -> dict[str, int | float]:
