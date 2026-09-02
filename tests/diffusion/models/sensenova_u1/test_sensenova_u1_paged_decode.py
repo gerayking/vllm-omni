@@ -172,7 +172,10 @@ def test_length_lives_in_device_tensors():
 # The capture contract. These need CUDA and the bundled flash-attention kernel.
 # ---------------------------------------------------------------------------
 
-cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+cuda_only = pytest.mark.skipif(
+    not torch.cuda.is_available() or not paged_decode.paged_decode_supported(torch.device("cuda"), 64),
+    reason="CUDA with bundled paged flash-attention required",
+)
 
 
 @cuda_only
