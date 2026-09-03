@@ -11,12 +11,14 @@ is exactly what the last test here pins.
 """
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
 from vllm.lora.layers import BaseLayerWithLoRA
 
 import vllm_omni.diffusion.models.sensenova_u1.paged_decode as paged_decode
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.sensenova_u1.paged_decode import (
     BLOCK_SIZE,
     BUCKETS,
@@ -179,8 +181,7 @@ cuda_only = pytest.mark.skipif(
 
 
 @cuda_only
-@pytest.mark.cuda
-@pytest.mark.L4
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_paged_attention_matches_sdpa_over_the_same_buffer():
     import torch.nn.functional as F
 
@@ -220,8 +221,7 @@ def test_paged_attention_matches_sdpa_over_the_same_buffer():
 
 
 @cuda_only
-@pytest.mark.cuda
-@pytest.mark.L4
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_a_captured_graph_follows_a_later_length():
     """One capture has to serve every length in the bucket.
 
@@ -281,8 +281,7 @@ def test_a_captured_graph_follows_a_later_length():
 
 
 @cuda_only
-@pytest.mark.cuda
-@pytest.mark.L4
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_a_captured_graph_writes_each_step_to_its_own_slot():
     """The write slot has to be a device tensor, not a Python index.
 
@@ -342,8 +341,7 @@ def test_a_captured_graph_writes_each_step_to_its_own_slot():
 
 
 @cuda_only
-@pytest.mark.cuda
-@pytest.mark.L4
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_a_whole_decode_loop_matches_the_unpaged_path():
     """Per-step kernel equivalence is not loop equivalence.
 
@@ -408,8 +406,7 @@ class _StubLM(torch.nn.Module):
 
 
 @cuda_only
-@pytest.mark.cuda
-@pytest.mark.L4
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_the_decode_graph_captures_into_the_shared_platform_pool(monkeypatch):
     """``_decode_context`` builds a runner per request, so a private capture pool
     hands every request its own arena and never gives it back. Measured on a
@@ -551,7 +548,7 @@ def test_a_kernel_missing_any_kwarg_we_pass_is_not_supported(monkeypatch):
 def test_only_q_k_and_v_reach_the_kernel_positionally(monkeypatch):
     """A positional standard argument binds to whatever a future wheel puts in
     that slot, and the probe above only checks that the names exist."""
-    seen = {}
+    seen: dict[str, Any] = {}
 
     def recorder(*args, **kwargs):
         seen["args"], seen["kwargs"] = args, kwargs
@@ -689,8 +686,7 @@ def test_no_capture_crosses_a_request_once_lora_wrappers_are_installed(monkeypat
 
 
 @cuda_only
-@pytest.mark.cuda
-@pytest.mark.L4
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_a_second_request_replays_the_first_capture(monkeypatch):
     """Reuse is only worth anything if the capture survives it."""
     dev = torch.device("cuda")
